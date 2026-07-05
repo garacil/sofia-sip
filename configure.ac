@@ -10,8 +10,16 @@ AC_PREREQ(2.57)
 dnl information on the package
 dnl ---------------------------
 
-dnl update both the version for AC_INIT and the LIBSOFIA_SIP_UA_MAJOR_MINOR
-AC_INIT([sofia-sip], [1.13.17])
+dnl The fork release version (garacil/sofia-sip) is read from the top-level
+dnl .version file, so a new release is a one-line edit of .version and a re-run
+dnl of autogen.sh + configure -- configure.ac never hardcodes the number.
+dnl The VER_LIBSOFIA_SIP_UA_MAJOR_MINOR / include_sofiadir below intentionally
+dnl stay at 1.13 (the unchanged 1.13.x API series and header layout) and the
+dnl libtool current:revision (LIBVER_* below) stay 6:0 -> libsofia-sip-ua.so.0.6.0,
+dnl so every release across the whole line keeps one stable header dir and soname
+dnl (a consumer -I .../sofia-sip-1.13 is valid for the entire series); only the
+dnl point version reported by pkg-config changes per release.
+AC_INIT([sofia-sip], m4_esyscmd_s([cat .version]))
 
 CFLAGS="$CFLAGS $CONFIGURE_CFLAGS"
 CXXFLAGS="$CXXFLAGS $CONFIGURE_CXXFLAGS"

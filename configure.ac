@@ -21,6 +21,15 @@ dnl (a consumer -I .../sofia-sip-1.13 is valid for the entire series); only the
 dnl point version reported by pkg-config changes per release.
 AC_INIT([sofia-sip], m4_esyscmd_s([cat .version]))
 
+dnl Record whether the user supplied their own optimization flags BEFORE the
+dnl bookkeeping appends below make CFLAGS non-empty. Autoconf only injects its
+dnl default -g -O2 when CFLAGS is empty, so once we append here it would stay
+dnl unset and the build would fall back to an unoptimized -O0. We restore an
+dnl optimized default further down (after the compiler is known) unless the user
+dnl opted in with their own CFLAGS / CONFIGURE_CFLAGS.
+sofia_user_cflags=${CFLAGS+set}
+sofia_user_configure_cflags="$CONFIGURE_CFLAGS"
+
 CFLAGS="$CFLAGS $CONFIGURE_CFLAGS"
 CXXFLAGS="$CXXFLAGS $CONFIGURE_CXXFLAGS"
 LDFLAGS="$LDFLAGS $CONFIGURE_LDFLAGS"
@@ -55,6 +64,16 @@ AC_LANG([C])
 AC_CHECK_COMPILATION_ENVIRONMENT
 
 SAC_TOOL_CC
+
+dnl Optimized production build by default. When the user did not pass their own
+dnl CFLAGS / CONFIGURE_CFLAGS we supply -O2 -g (the standard production level for
+dnl a branchy signaling library; -O3's vectorization/unrolling does little for
+dnl SIP parsing and state machines and can regress i-cache). Passing CFLAGS=...
+dnl or CONFIGURE_CFLAGS=... opts out and is preserved verbatim, so e.g.
+dnl CFLAGS="-O3 -g" is honoured unchanged.
+AS_IF([test "x$sofia_user_cflags" != xset && test -z "$sofia_user_configure_cflags" && test "x$GCC" = xyes],
+      [CFLAGS="-O2 -g $CFLAGS"])
+
 AC_PROG_INSTALL
 AC_PROG_CPP
 AC_CHECK_PROG(ETAGS, etags, etags, echo)

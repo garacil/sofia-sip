@@ -88,7 +88,7 @@ rm -rf $RPM_BUILD_ROOT
 %files
 %defattr(-,root,root,-)
 %{_libdir}/libsofia-sip-ua.so.*
-%doc AUTHORS COPYING COPYRIGHTS README
+%doc AUTHORS COPYING COPYRIGHTS README.md
 
 %if %{have_glib}
 # note: soname in pkgname allows install of multiple library versions
@@ -106,7 +106,7 @@ GLib interface to Sofia SIP User Agent library.
 %files 		glib@LIBVER_SOFIA_SIP_UA_GLIB_SOVER@
 %defattr(-,root,root,-)
 %{_libdir}/libsofia-sip-ua-glib.so.*
-%doc AUTHORS COPYING COPYRIGHTS README libsofia-sip-ua-glib/ChangeLog
+%doc AUTHORS COPYING COPYRIGHTS README.md libsofia-sip-ua-glib/ChangeLog
 
 %post glib@LIBVER_SOFIA_SIP_UA_GLIB_SOVER@ -p /sbin/ldconfig
 %postun glib@LIBVER_SOFIA_SIP_UA_GLIB_SOVER@ -p /sbin/ldconfig

@@ -4628,11 +4628,199 @@ tport_t *tport_primary_by_name(tport_t const *tp, tp_name_t const *tpn)
 }
 
 
-/** Get transport by name. */
+/** Test if two primary transports are interchangeable for sending. */
+static int tport_primary_same_kind(tport_t const *a, tport_t const *b)
+{
+  char const *ia = a->tp_ident, *ib = b->tp_ident;
+
+  if (ia != ib && (!ia || !ib || strcmp(ia, ib)))
+    return 0;
+
+  return
+    a->tp_pri->pri_public == b->tp_pri->pri_public &&
+    a->tp_addrinfo->ai_family == b->tp_addrinfo->ai_family &&
+    a->tp_addrinfo->ai_socktype == b->tp_addrinfo->ai_socktype &&
+    a->tp_name->tpn_comp == b->tp_name->tpn_comp &&
+    su_casematch(a->tp_protoname, b->tp_protoname);
+}
+
+/** Get the primary bound to the address the kernel would use as the source
+ *  towards @a dst.
+ *
+ * A wildcard bind gives every local address a primary of its own.  A
+ * datagram always carries the address of the socket it is sent from, and a
+ * new connection is bound to the address of its primary, whatever interface
+ * the routing table sends the packets through.  The routing table is asked
+ * which source address it would pick (connect() on a datagram socket does
+ * the route lookup and sends nothing), and the primary of the same kind and
+ * port as @a self bound to that address is returned.
+ *
+ * @return NULL when @a self is the only primary of its kind on its port,
+ * when the lookup fails or when no primary is bound to that address.
+ */
+static tport_t const *tport_primary_by_route(tport_t const *self,
+					     su_sockaddr_t const *dst,
+					     socklen_t dstlen)
+{
+  tport_primary_t const *pri;
+  tport_t const *tp;
+  su_sockaddr_t peer[1], local[1];
+  socklen_t locallen = (socklen_t)sizeof local;
+  su_socket_t s;
+  char addr[SU_ADDRSIZE];
+  int n = 0;
+
+  for (pri = self->tp_master->mr_primaries; pri && n < 2; pri = pri->pri_next)
+    if (tport_primary_same_kind(pri->pri_primary, self) &&
+	pri->pri_primary->tp_addr->su_port == self->tp_addr->su_port)
+      n++;
+  if (n < 2)
+    return NULL;
+
+  memset(peer, 0, sizeof peer);
+  memcpy(peer, dst, dstlen);
+  if (peer->su_port == 0)
+    peer->su_port = htons(5060);	/* the route does not depend on it */
+
+  s = su_socket(dst->su_family, SOCK_DGRAM, 0);
+  if (s == INVALID_SOCKET) {
+    SU_DEBUG_3(("tport(%p): route lookup: socket: %s\n",
+		(void *)self, su_strerror(su_errno())));
+    return NULL;
+  }
+  memset(local, 0, sizeof local);
+  if (connect(s, &peer->su_sa, dstlen) < 0 ||
+      getsockname(s, &local->su_sa, &locallen) < 0 ||
+      local->su_family != dst->su_family) {
+    SU_DEBUG_3(("tport(%p): route lookup: %s\n",
+		(void *)self, su_strerror(su_errno())));
+    su_close(s);
+    return NULL;
+  }
+  su_close(s);
+
+  for (pri = self->tp_master->mr_primaries; pri; pri = pri->pri_next) {
+    tp = pri->pri_primary;
+    if (!tport_primary_same_kind(tp, self) ||
+	tp->tp_addr->su_port != self->tp_addr->su_port ||
+	tp->tp_addr->su_family != local->su_family ||
+	memcmp(SU_ADDR(tp->tp_addr), SU_ADDR(local), SU_ADDRLEN(local)))
+      continue;
+    return tp;
+  }
+
+  SU_DEBUG_5(("tport(%p): route source %s has no %s primary\n",
+	      (void *)self,
+	      su_inet_ntop(local->su_family, SU_ADDR(local), addr, sizeof addr),
+	      self->tp_protoname));
+
+  return NULL;
+}
+
+/** Get a reusable secondary (connection) of the primary @a pri to the named
+ *  peer.
+ *
+ * The peer is matched by address when @a resolved, else by name and port.
+ */
+static tport_t const *tport_secondary_by_name(tport_t const *pri,
+					      tp_name_t const *tpn,
+					      char const *host,
+					      char const *port,
+					      char const *canon,
+					      char const *comp,
+					      su_sockaddr_t const *su,
+					      socklen_t sulen,
+					      int resolved)
+{
+  tport_t const *sub = pri->tp_pri->pri_open, *next = NULL;
+  int cmp;
+
+  if (resolved) {
+    /* Depth-first search */
+    while (sub) {
+      cmp = (int)((size_t)sub->tp_addrlen - (size_t)sulen);
+
+      if (cmp == 0)
+	cmp = memcmp(sub->tp_addr, su, sulen);
+
+      if (cmp == 0) {
+	if (sub->tp_left) {
+	  next = sub;
+	  sub = sub->tp_left;
+	  continue;
+	}
+	break;
+      }
+      else if (next) {
+	sub = next;
+	break;
+      }
+      else if (cmp > 0) {
+	sub = sub->tp_left;
+	continue;
+      }
+      else /* if (cmp < 0) */ {
+	sub = sub->tp_right;
+	continue;
+      }
+    }
+  }
+  else {
+    SU_DEBUG_7(("tport(%p): EXPENSIVE unresolved " TPN_FORMAT "\n",
+		(void *)pri, TPN_ARGS(tpn)));
+
+    sub = tprb_first(sub);
+  }
+
+  for (; sub; sub = tprb_succ(sub)) {
+    if (!sub->tp_reusable)
+      continue;
+    if (!tport_is_registered(sub))
+      continue;
+    if (tport_is_shutdown(sub))
+      continue;
+
+    if (comp != sub->tp_name->tpn_comp)
+      continue;
+
+    if (resolved) {
+      if ((socklen_t)sub->tp_addrlen != sulen ||
+	  memcmp(sub->tp_addr, su, sulen)) {
+	SU_DEBUG_7(("tport(%p): not found by name " TPN_FORMAT "\n",
+		    (void *)pri, TPN_ARGS(tpn)));
+	break;
+      }
+      SU_DEBUG_7(("tport(%p): found %p by name " TPN_FORMAT "\n",
+		  (void *)pri, (void *)sub, TPN_ARGS(tpn)));
+    }
+    else if (!su_casematch(port, sub->tp_port))
+      continue;
+    else if (!su_casematch(canon, sub->tp_canon) &&
+	     !su_casematch(host, sub->tp_host))
+      continue;
+
+    return sub;
+  }
+
+  return NULL;
+}
+
+/** Get transport by name.
+ *
+ * When @a self is not a primary transport, the primary is looked up by the
+ * name.  A wildcard bind leaves one primary per local address and the
+ * lookup by name returns the first one, so then:
+ * - a connection to the peer is reused whichever primary it belongs to (a
+ *   peer may have connected to any of the local addresses);
+ * - otherwise the message is sent (datagram) or the connection is opened
+ *   (stream) from the primary bound to the source address the routing table
+ *   picks towards the peer, as a socket bound to the wildcard address would.
+ */
 tport_t *tport_by_name(tport_t const *self, tp_name_t const *tpn)
 {
-  tport_t const *sub, *next;
+  tport_t const *sub;
   char const *canon, *host, *port, *comp;
+  int looked_up = 0;
 #if SU_HAVE_IN6
   char *end, ipaddr[TPORT_HOSTPORTSIZE];
 #endif
@@ -4642,8 +4830,10 @@ tport_t *tport_by_name(tport_t const *self, tp_name_t const *tpn)
   assert(tpn->tpn_proto); assert(tpn->tpn_host); assert(tpn->tpn_port);
   assert(tpn->tpn_canon);
 
-  if (!tport_is_primary(self))
+  if (!tport_is_primary(self)) {
     self = tport_primary_by_name(self, tpn);
+    looked_up = 1;
+  }
 
   host = strcmp(tpn->tpn_host, tpn_any) ? tpn->tpn_host : NULL;
   port = strcmp(tpn->tpn_port, tpn_any) ? tpn->tpn_port : NULL;
@@ -4651,11 +4841,9 @@ tport_t *tport_by_name(tport_t const *self, tp_name_t const *tpn)
   comp = tport_canonize_comp(tpn->tpn_comp);
 
   if (self && host && port) {
-    int resolved = 0, cmp;
+    int resolved;
     socklen_t sulen;
     su_sockaddr_t su[1];
-
-    sub = self->tp_pri->pri_open;
 
     memset(su, 0, sizeof su);
 
@@ -4682,74 +4870,36 @@ tport_t *tport_by_name(tport_t const *self, tp_name_t const *tpn)
 
     su->su_port = htons(strtoul(port, NULL, 10));
 
-    if (su_inet_pton(su->su_family, host, SU_ADDR(su)) > 0) {
-      resolved = 1;
-      next = NULL;
+    resolved = su_inet_pton(su->su_family, host, SU_ADDR(su)) > 0;
 
-      /* Depth-first search */
-      while (sub) {
-	cmp = (int)((size_t)sub->tp_addrlen - (size_t)sulen);
-
-	if (cmp == 0)
-	  cmp = memcmp(sub->tp_addr, su, sulen);
-
-	if (cmp == 0) {
-	  if (sub->tp_left) {
-	    next = sub;
-	    sub = sub->tp_left;
-	    continue;
-	  }
-	  break;
-	}
-	else if (next) {
-	  sub = next;
-	  break;
-	}
-	else if (cmp > 0) {
-	  sub = sub->tp_left;
-	  continue;
-	}
-	else /* if (cmp < 0) */ {
-	  sub = sub->tp_right;
-	  continue;
-	}
-      }
-    }
-    else {
-      SU_DEBUG_7(("tport(%p): EXPENSIVE unresolved " TPN_FORMAT "\n",
-		  (void *)self, TPN_ARGS(tpn)));
-
-      sub = tprb_first(sub);
-    }
-
-    for (; sub; sub = tprb_succ(sub)) {
-      if (!sub->tp_reusable)
-	continue;
-      if (!tport_is_registered(sub))
-	continue;
-      if (tport_is_shutdown(sub))
-	continue;
-
-      if (comp != sub->tp_name->tpn_comp)
-	continue;
-
-      if (resolved) {
-	if ((socklen_t)sub->tp_addrlen != sulen ||
-	    memcmp(sub->tp_addr, su, sulen)) {
-	  SU_DEBUG_7(("tport(%p): not found by name " TPN_FORMAT "\n",
-		      (void *)self, TPN_ARGS(tpn)));
-	  break;
-	}
-	SU_DEBUG_7(("tport(%p): found %p by name " TPN_FORMAT "\n",
-		    (void *)self, (void *)sub, TPN_ARGS(tpn)));
-      }
-      else if (!su_casematch(port, sub->tp_port))
-	continue;
-      else if (!su_casematch(canon, sub->tp_canon) &&
-	       !su_casematch(host, sub->tp_host))
-	continue;
-
+    sub = tport_secondary_by_name(self, tpn, host, port, canon, comp,
+				  su, sulen, resolved);
+    if (sub)
       return (tport_t *)sub;
+
+    if (looked_up) {
+      tport_primary_t const *pri;
+      tport_t const *by_route;
+
+      if (!tport_is_dgram(self)) {
+	for (pri = self->tp_master->mr_primaries; pri; pri = pri->pri_next) {
+	  if (pri->pri_primary == self ||
+	      !tport_primary_same_kind(pri->pri_primary, self))
+	    continue;
+	  sub = tport_secondary_by_name(pri->pri_primary, tpn, host, port,
+					canon, comp, su, sulen, resolved);
+	  if (sub)
+	    return (tport_t *)sub;
+	}
+      }
+
+      if (resolved &&
+	  (by_route = tport_primary_by_route(self, su, sulen)) &&
+	  by_route != self) {
+	SU_DEBUG_7(("tport(%p): " TPN_FORMAT " from %p by route\n",
+		    (void *)self, TPN_ARGS(tpn), (void *)by_route));
+	self = by_route;
+      }
     }
   }
 

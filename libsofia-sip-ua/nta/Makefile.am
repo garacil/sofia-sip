@@ -30,8 +30,6 @@ dist_noinst_SCRIPTS =	run_test_nta_api run_test_nta
 
 TESTS =			run_check_nta run_test_nta_api run_test_nta
 
-TESTS_ENVIRONMENT =	$(SHELL)
-
 # ----------------------------------------------------------------------
 # Rules for building the targets
 
@@ -49,19 +47,14 @@ libnta_la_SOURCES = 	nta.c nta_check.c nta_tag.c nta_tag_ref.c \
 
 COVERAGE_INPUT = 	$(libnta_la_SOURCES) $(include_sofia_HEADERS)
 
-LDADD = 		libnta.la \
-			../ipt/libipt.la \
-			../sip/libsip.la \
-			../features/libfeatures.la \
-			../sresolv/libsresolv.la \
-			../tport/libtport.la \
-			../http/libhttp.la \
-			../stun/libstun.la \
-			../url/liburl.la \
-			../msg/libmsg.la \
-			../bnf/libbnf.la \
-			../su/libsu.la \
-			${top_builddir}/s2check/libs2.a -lz
+# The test programs link the whole library, not the per-module convenience
+# libraries: nta.c calls nua_client_intercept_query_results() (nua), and nua
+# calls nta, so a static link of the modules one by one leaves that symbol
+# unresolved whatever their order. One archive is rescanned until everything
+# resolves. libs2.a goes first: it uses the library's symbols. Run `make`
+# before `make check`, as the library is linked after its modules.
+LDADD = 		${top_builddir}/s2check/libs2.a \
+			../libsofia-sip-ua.la -lz
 
 test_nta_LDFLAGS = 	-static
 

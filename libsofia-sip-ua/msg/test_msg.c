@@ -468,6 +468,9 @@ int test_header_parsing(void)
 				"msg-size=782572564",
 				"name-space-url=\"http://www.nokia.com/foo\"",
 				"foo=bar");
+    TEST_1(c);
+    TEST_S(c->c_type, "text/plain");
+    TEST_S(c->c_subtype, "plain");
 
     su_home_deinit(home);
   }
@@ -1178,7 +1181,7 @@ int test_copy(void)
     char dst[8];
     const char *src = "1234567";
 
-    char *start = &dst;
+    char *start = dst;
     char *end = start+sizeof(dst);
     MSG_STRING_E(start, end, src);
     TEST_S(dst, src);

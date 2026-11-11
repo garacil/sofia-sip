@@ -38,6 +38,7 @@ version advances — releases here are **2.0.x**, read from the top-level
 | **STUN** | Removed an overlapping / address-of-pointer copy that clobbered a resolved server address. |
 | **Build** | **Optimized by default again** — a plain `./configure` builds at `-O2 -g` (upstream had silently dropped the optimization default); your own `CFLAGS` still override. |
 | **Multihomed hosts** | With a wildcard bind (one socket per local address), a new request is sent — and a new connection opened — **from the address the routing table picks towards the destination**, as a single wildcard socket would do, and a connection a peer opened to any of the local addresses is reused. Before, every request left from the first address (wrong source IP and `Via` through a VPN or a second network) and a client connected to another address got `503`. |
+| **Repeated local addresses** | With a wildcard bind, an address that several interfaces carry (point-to-point tunnels sharing their local end) is **listened on once**. Before, its second bind failed with `EADDRINUSE` and so did the whole bind (`nua_create()` returned NULL on such a host). A listen that fails on a fixed port is now logged at level 3 with the address, port and transport. |
 
 The full history is in the [releases](https://github.com/garacil/sofia-sip/releases).
 

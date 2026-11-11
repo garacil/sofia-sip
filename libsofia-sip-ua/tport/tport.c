@@ -1787,6 +1787,15 @@ int tport_bind_server(tport_master_t *mr,
 	case ESOCKTNOSUPPORT:	/* Socket type not supported */
 	  continue;
 	default:
+	  if (port0 != 0) {
+	    /* A fixed port: the bind fails here, say which address and why. */
+	    char buf[SU_ADDRSIZE];
+	    SU_DEBUG_3(("%s(%p): cannot listen on %s %s port %u: %s\n",
+			__func__, (void *)mr, ai->ai_canonname,
+			su_inet_ntop(su->su_family, SU_ADDR(su),
+				     buf, sizeof buf),
+			port, su_strerror(error)));
+	  }
 	  break;
 	}
 	break;
@@ -1937,6 +1946,28 @@ int tport_server_addrinfo(tport_master_t *mr,
   return tport_get_local_addrinfo(mr, service, hints, return_addrinfo);
 }
 
+/** Return true if two local addresses are the same address (port ignored).
+ *
+ * IPv6 addresses also compare their scope (a link-local address is distinct
+ * on each interface).
+ */
+static
+int
+tport_local_addr_is_same(su_sockaddr_t const *a, su_sockaddr_t const *b)
+{
+  if (a->su_family != b->su_family)
+    return 0;
+  if (a->su_family == AF_INET)
+    return a->su_sin.sin_addr.s_addr == b->su_sin.sin_addr.s_addr;
+#if SU_HAVE_IN6
+  if (a->su_family == AF_INET6)
+    return memcmp(&a->su_sin6.sin6_addr, &b->su_sin6.sin6_addr,
+		  sizeof a->su_sin6.sin6_addr) == 0 &&
+      a->su_sin6.sin6_scope_id == b->su_sin6.sin6_scope_id;
+#endif
+  return 0;
+}
+
 /** Convert localinfo into addrinfo */
 static
 int
@@ -1994,8 +2025,34 @@ tport_get_local_addrinfo(tport_master_t *mr,
 
   for (li = li_result; li; li = li->li_next) {
     for (h = hints; h; h = h->ai_next) {
+      su_addrinfo_t *seen;
+      char buf[SU_ADDRSIZE];
+
       if (h->ai_family && h->ai_family != li->li_family)
 	continue;
+
+      /* One listener per local address and transport. Several interfaces can
+       * carry the same address (point-to-point tunnels sharing their local
+       * end): su_getlocalinfo() lists it once per address entry, and binding
+       * it a second time would fail with EADDRINUSE and make the whole
+       * wildcard bind fail. */
+      for (seen = *return_ai; seen; seen = seen->ai_next) {
+	if (seen->ai_family == li->li_family &&
+	    seen->ai_socktype == h->ai_socktype &&
+	    seen->ai_protocol == h->ai_protocol &&
+	    su_strmatch(seen->ai_canonname, h->ai_canonname) &&
+	    tport_local_addr_is_same((su_sockaddr_t *)seen->ai_addr,
+				     li->li_addr))
+	  break;
+      }
+      if (seen) {
+	SU_DEBUG_5(("%s(%p): %s %s listed more than once, listened on once\n",
+		    __func__, (void *)mr,
+		    h->ai_canonname ? h->ai_canonname : "*",
+		    su_inet_ntop(li->li_family, SU_ADDR(li->li_addr),
+				 buf, sizeof buf)));
+	continue;
+      }
 
       ai = calloc(1, sizeof *ai + li->li_addrlen);
       if (ai == NULL)

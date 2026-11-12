@@ -44,6 +44,7 @@
 #include <sofia-sip/su_tagarg.h>
 #include <sofia-sip/su_tag_io.h>
 #include <sofia-sip/sres_sip.h>
+#include <sofia-sip/msg_addr.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -185,6 +186,138 @@ END_TEST
 
 /* ---------------------------------------------------------------------- */
 
+/* The agent is bound to the wildcard address: it has no address of its own.
+ * Every address of 127.0.0.0/8 is local on Linux, which gives the tests a
+ * host with several addresses. */
+
+static char const *message_address(msg_t *msg, int local, char addr[SU_ADDRSIZE])
+{
+  su_sockaddr_t su[1];
+  socklen_t sulen = sizeof su;
+
+  if ((local ? msg_get_local_address(msg, su, &sulen)
+       : msg_get_address(msg, su, &sulen)) < 0)
+    return NULL;
+
+  return su_inet_ntop(su->su_family, SU_ADDR(su), addr, SU_ADDRSIZE);
+}
+
+START_TEST(client_2_0_3)
+{
+  nta_outgoing_t *orq;
+  struct message *request;
+  struct event *response;
+  char *route;
+  char addr[SU_ADDRSIZE];
+
+  S2_CASE("client-2.0.3", "Send MESSAGE to another address of the host",
+	  "The Via, and a Contact with the name of the transport, "
+	  "name the address the request leaves from");
+
+#if defined(__linux__)
+  route = su_sprintf(NULL, "sip:127.0.0.2:%s",
+		     s2sip->contact->m_url->url_port);
+  fail_unless(route != NULL);
+
+  orq = nta_outgoing_tcreate(s2->default_leg,
+			     s2_nta_orq_callback, NULL,
+			     (url_string_t *)route,
+			     SIP_METHOD_MESSAGE,
+			     URL_STRING_MAKE("sip:test2.0.example.org"),
+			     SIPTAG_FROM_STR("<sip:client@example.net>"),
+			     /* The Contact the agent made from the name of
+				its transport, and one of the application */
+			     SIPTAG_CONTACT(nta_agent_contact(s2->nta)),
+			     SIPTAG_CONTACT_STR("<sip:app@198.51.100.7>"),
+			     TAG_END());
+  fail_unless(orq != NULL);
+  request = s2_sip_wait_for_request(SIP_METHOD_MESSAGE);
+  fail_unless(request != NULL);
+
+  /* It arrived on the address it was sent to */
+  fail_unless(message_address(request->msg, 1, addr) != NULL);
+  fail_unless(strcmp(addr, "127.0.0.2") == 0);
+
+  /* It left from the address the route to 127.0.0.2 picks, and its Via
+     names that address, not the name the transport got when it was bound */
+  fail_unless(message_address(request->msg, 0, addr) != NULL);
+  fail_unless(strcmp(addr, "127.0.0.1") == 0);
+  fail_unless(request->sip->sip_via != NULL);
+  fail_unless(strcmp(request->sip->sip_via->v_host, "127.0.0.1") == 0);
+
+  /* So does the Contact that carried the name of the transport; the
+     Contact the application wrote is as it wrote it */
+  fail_unless(request->sip->sip_contact != NULL);
+  fail_unless(strcmp(request->sip->sip_contact->m_url->url_host,
+		     "127.0.0.1") == 0);
+  fail_unless(request->sip->sip_contact->m_next != NULL);
+  fail_unless(strcmp(request->sip->sip_contact->m_next->m_url->url_host,
+		     "198.51.100.7") == 0);
+
+  s2_sip_respond_to(request, NULL, 200, "2.0.3", TAG_END());
+  response = s2_nta_wait_for(wait_for_orq, orq,
+			     wait_for_status, 200,
+			     0);
+  s2_sip_free_message(request);
+  s2_nta_free_event(response);
+  nta_outgoing_destroy(orq);
+  su_free(NULL, route);
+#endif
+}
+END_TEST
+
+START_TEST(client_2_0_4)
+{
+  struct dialog *d;
+  struct event *request;
+  struct message *response;
+  sip_contact_t const *m;
+  char *rq;
+  char addr[SU_ADDRSIZE];
+
+  S2_CASE("client-2.0.4", "Answer a request sent to another address",
+	  "The response leaves from the address the request arrived on "
+	  "(RFC 3581 section 4)");
+
+#if defined(__linux__)
+  d = su_home_new(sizeof *d); fail_unless(d != NULL);
+
+  fail_unless((m = nta_agent_contact(s2->nta)) != NULL);
+  rq = su_sprintf(d->home, "MESSAGE sip:127.0.0.2:%s SIP/2.0",
+		  url_port(m->m_url));
+  fail_unless(rq != NULL);
+
+  fail_unless(s2_sip_request_to(d, SIP_METHOD_MESSAGE, s2sip->udp.tport,
+				SIPTAG_REQUEST_STR(rq),
+				SIPTAG_FROM_STR("<sip:test@example.net>"),
+				SIPTAG_TO_STR("<sip:agent@example.org>"),
+				TAG_END()) == 0);
+
+  request = s2_nta_wait_for(wait_for_method, (void *)sip_method_message, 0);
+  fail_unless(request != NULL);
+  fail_unless(request->irq != NULL);
+
+  /* The agent knows which of its addresses the request was sent to */
+  fail_unless(message_address(request->msg, 1, addr) != NULL);
+  fail_unless(strcmp(addr, "127.0.0.2") == 0);
+
+  nta_incoming_treply(request->irq, SIP_200_OK, TAG_END());
+  nta_incoming_destroy(request->irq);
+  s2_nta_free_event(request);
+
+  response = s2_sip_wait_for_response(200, SIP_METHOD_MESSAGE);
+  fail_unless(response != NULL);
+
+  /* The route back to the sender would pick 127.0.0.1 */
+  fail_unless(message_address(response->msg, 0, addr) != NULL);
+  fail_unless(strcmp(addr, "127.0.0.2") == 0);
+
+  s2_sip_free_message(response);
+  su_home_unref(d->home);
+#endif
+}
+END_TEST
+
 TCase *check_nta_client_2_0(void)
 {
   TCase *tc = tcase_create("NTA 2.0 - Client");
@@ -196,6 +329,8 @@ TCase *check_nta_client_2_0(void)
   tcase_add_test(tc, client_2_0_0);
   tcase_add_test(tc, client_2_0_1);
   tcase_add_test(tc, client_2_0_2);
+  tcase_add_test(tc, client_2_0_3);
+  tcase_add_test(tc, client_2_0_4);
 
   return tc;
 }

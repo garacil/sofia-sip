@@ -806,6 +806,248 @@ static int udp_test(tp_test_t *tt)
   END();
 }
 
+/** Make the message udp_test() sends. */
+static msg_t *listen_msg(tp_test_t *tt)
+{
+  msg_t *msg = msg_create(tt->tt_mclass, 0);
+  msg_test_t *tst = msg ? msg_test_public(msg) : NULL;
+  su_home_t *home = msg ? msg_home(msg) : NULL;
+  msg_payload_t *pl;
+
+  if (!tst)
+    return NULL;
+
+  if (msg_header_insert(msg, (void *)tst, (msg_header_t *)
+			msg_request_make(home, "DO im:foo@faa "
+					 TPORT_TEST_VERSION)) < 0 ||
+      !(pl = msg_payload_make(home, payload)) ||
+      msg_header_insert(msg, (void *)tst, (msg_header_t *)pl) < 0 ||
+      msg_header_insert(msg, (void *)tst, (msg_header_t *)
+			msg_content_length_format(home, MOD_ZU,
+						  (size_t)pl->pl_len)) < 0 ||
+      msg_header_insert(msg, (void *)tst, (msg_header_t *)
+			msg_content_md5_make(home,
+					     "R6nitdrtJFpxYzrPaSXfrA==")) < 0 ||
+      msg_header_insert(msg, (void *)tst, (msg_header_t *)
+			msg_separator_create(home)) < 0 ||
+      msg_serialize(msg, (void *)tst) < 0) {
+    msg_destroy(msg);
+    return NULL;
+  }
+
+  return msg;
+}
+
+/** Bind a server master of its own to @a host, UDP only, any port. */
+static tport_t *listen_master(tp_test_t *tt, char const *host,
+			      char const *interfaces, tp_name_t to[1])
+{
+  static char const * const transports[] = { "udp", NULL };
+  tp_name_t name[1] = {{ "udp", "*", NULL, "*", NULL, "scope" }};
+  tport_t *master, *tp;
+
+  name->tpn_host = host;
+
+  master = tport_tcreate(tt, tp_test_class, tt->tt_root, TAG_END());
+  if (!master)
+    return NULL;
+
+  if (tport_tbind(master, name, transports,
+		  TPTAG_SERVER(1),
+		  TAG_IF(interfaces, TPTAG_INTERFACE(interfaces)),
+		  TAG_END()) < 0 ||
+      !(tp = tport_primaries(master))) {
+    tport_destroy(master);
+    return NULL;
+  }
+
+  /* Where a client on this host reaches it */
+  *to = *tport_name(tp);
+  to->tpn_canon = to->tpn_host = "127.0.0.1";
+  to->tpn_comp = NULL, to->tpn_ident = NULL;
+
+  return master;
+}
+
+/* A transport bound to the wildcard address serves every local address:
+ * each message has its own local address, a reply leaves from it, and a
+ * request to a known peer leaves from the address that peer talks to. A
+ * transport can also listen on one address the host does not have yet, or
+ * on named interfaces only.
+ *
+ * Every address of 127.0.0.0/8 is local on Linux, which gives the test a
+ * host with several addresses.
+ */
+static int listen_test(tp_test_t *tt)
+{
+  tport_t *tp, *udp = NULL, *tcp = NULL, *master;
+  msg_t *msg;
+  tp_name_t to[1], back[1];
+  su_sockaddr_t local[1], peer[1];
+  socklen_t len;
+  char port[8], addr[SU_ADDRSIZE];
+  char backhost[SU_ADDRSIZE], backport[8];
+
+  BEGIN();
+
+#if defined(__linux__)
+  if (!getenv("TPORT_TEST_HOST")) {
+    /* The server transports were bound to "*": one socket per transport */
+    for (tp = tport_primaries(tt->tt_srv_tports); tp; tp = tport_next(tp)) {
+      if (!tport_has_ip4(tp) || strcmp(tport_name(tp)->tpn_ident, "server"))
+	continue;
+      if (strcmp(tport_name(tp)->tpn_proto, "udp") == 0) {
+	TEST_P(udp, NULL); udp = tp;
+      }
+      else if (strcmp(tport_name(tp)->tpn_proto, "tcp") == 0) {
+	TEST_P(tcp, NULL); tcp = tp;
+      }
+    }
+    TEST_1(udp); TEST_1(tcp);
+    TEST_1(tport_is_wildcard(udp)); TEST_1(!tport_is_named(udp));
+    TEST_1(tport_is_wildcard(tcp)); TEST_1(!tport_is_named(tcp));
+
+    /* A datagram to the second loopback address arrives with that address */
+    *to = *tport_name(udp);
+    to->tpn_canon = to->tpn_host = "127.0.0.2";
+    to->tpn_comp = NULL, to->tpn_ident = NULL;
+
+    TEST_1(msg = listen_msg(tt));
+    TEST_1(tport_tsend(tt->tt_tports, msg, to, TAG_END()));
+    TEST(tport_test_run(tt, 5), 1);
+    msg_destroy(msg);
+
+    TEST_1(tt->tt_rmsg); TEST_P(tt->tt_rtport, udp);
+    len = sizeof local;
+    TEST(msg_get_local_address(tt->tt_rmsg, local, &len), 0);
+    TEST(local->su_family, AF_INET);
+    TEST_S(su_inet_ntop(AF_INET, SU_ADDR(local), addr, sizeof addr),
+	   "127.0.0.2");
+
+    /* The route to the client would give 127.0.0.1 */
+    len = sizeof peer;
+    TEST(msg_get_address(tt->tt_rmsg, peer, &len), 0);
+    TEST(peer->su_family, AF_INET);
+    TEST_1(su_inet_ntop(AF_INET, SU_ADDR(peer), backhost, sizeof backhost));
+    snprintf(backport, sizeof backport, "%u", ntohs(peer->su_port));
+    memset(back, 0, sizeof back);
+    back->tpn_proto = "udp";
+    back->tpn_canon = back->tpn_host = backhost;
+    back->tpn_port = backport;
+    TEST(tport_source_address(udp, back, local), 0);
+    TEST_S(su_inet_ntop(AF_INET, SU_ADDR(local), addr, sizeof addr),
+	   "127.0.0.1");
+
+    /* Once the flow is learnt, a request to the client leaves from the
+       address the client talks to */
+    tport_flow_learn(udp, tt->tt_rmsg);
+    TEST(tport_source_address(udp, back, local), 0);
+    TEST_S(su_inet_ntop(AF_INET, SU_ADDR(local), addr, sizeof addr),
+	   "127.0.0.2");
+
+    /* A reply sent from that address reaches the client: its socket is
+       connected to 127.0.0.2 and takes nothing from another address */
+    TEST_1(msg = listen_msg(tt));
+    TEST(msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local)), 0);
+    tp = tt->tt_rtport;
+    TEST_1(tport_tsend(tp, msg, back, TAG_END()));
+    TEST(tport_test_run(tt, 5), 1);
+    msg_destroy(msg);
+    TEST_1(tt->tt_rmsg);
+    TEST_S(tport_name(tport_parent(tt->tt_rtport))->tpn_ident, "client");
+
+    /* A local address the host does not have is refused by the kernel:
+       the datagram goes out from the address the route picks and the
+       message forgets its local address */
+    {
+      su_socket_t s;
+      su_sockaddr_t su[1], from[1];
+      socklen_t sulen = sizeof su->su_sin, fromlen = sizeof from;
+      struct timeval tv = { 2, 0 };
+      char buf[64];
+
+      memset(su, 0, sizeof su);
+      s = su_socket(su->su_family = AF_INET, SOCK_DGRAM, 0);
+      TEST_1(s != INVALID_SOCKET);
+      TEST(su_inet_pton(AF_INET, "127.0.0.1", SU_ADDR(su)), 1);
+      TEST_1(bind(s, &su->su_sa, sulen) != -1);
+      TEST_1(getsockname(s, &su->su_sa, &sulen) != -1);
+      TEST_1(setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+			(void *)&tv, sizeof tv) != -1);
+      snprintf(backport, sizeof backport, "%u", ntohs(su->su_port));
+
+      TEST_1(msg = listen_msg(tt));
+      memset(local, 0, sizeof local);
+      local->su_len = sizeof local->su_sin;
+      local->su_family = AF_INET;
+      TEST(su_inet_pton(AF_INET, "192.0.2.77", SU_ADDR(local)), 1);
+      TEST(msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local)), 0);
+      TEST_1(tport_tsend(udp, msg, back, TAG_END()));
+      TEST(msg_get_local_address(msg, NULL, NULL), -1);
+      msg_destroy(msg);
+
+      memset(from, 0, sizeof from);
+      TEST_1(su_recvfrom(s, buf, sizeof buf, 0, &from->su_sa, &fromlen) > 0);
+      TEST_S(su_inet_ntop(AF_INET, SU_ADDR(from), addr, sizeof addr),
+	     "127.0.0.1");
+      su_close(s);
+    }
+
+    /* A connection to the second loopback address knows its own address */
+    *to = *tport_name(tcp);
+    to->tpn_canon = to->tpn_host = "127.0.0.2";
+    to->tpn_comp = NULL, to->tpn_ident = NULL;
+
+    TEST_1(msg = listen_msg(tt));
+    TEST_1(tport_tsend(tt->tt_tports, msg, to, TPTAG_REUSE(0), TAG_END()));
+    TEST(tport_test_run(tt, 5), 1);
+    msg_destroy(msg);
+
+    TEST_1(tt->tt_rmsg); TEST_P(tport_parent(tt->tt_rtport), tcp);
+    len = sizeof local;
+    TEST(msg_get_local_address(tt->tt_rmsg, local, &len), 0);
+    TEST_S(su_inet_ntop(AF_INET, SU_ADDR(local), addr, sizeof addr),
+	   "127.0.0.2");
+    snprintf(port, sizeof port, "%u", ntohs(local->su_port));
+    TEST_S(port, tport_name(tcp)->tpn_port);
+    TEST(tport_source_address(tt->tt_rtport, NULL, local), 0);
+    TEST_S(su_inet_ntop(AF_INET, SU_ADDR(local), addr, sizeof addr),
+	   "127.0.0.2");
+
+    /* A transport for an interface that does not exist takes nothing */
+    TEST_1(master = listen_master(tt, "0.0.0.0", "tport-test-none", to));
+    TEST_1(msg = listen_msg(tt));
+    TEST_1(tport_tsend(tt->tt_tports, msg, to, TAG_END()));
+    TEST(tport_test_run(tt, 1), 0);
+    msg_destroy(msg);
+    tport_destroy(master);
+
+    /* A transport for the loopback interface takes what arrives on it:
+       the interfaces are matched by name, here one of two */
+    TEST_1(master = listen_master(tt, "0.0.0.0", "tport-test-none,lo", to));
+    TEST_1(msg = listen_msg(tt));
+    TEST_1(tport_tsend(tt->tt_tports, msg, to, TAG_END()));
+    TEST(tport_test_run(tt, 5), 1);
+    msg_destroy(msg);
+    TEST_1(tt->tt_rmsg);
+    TEST_P(tport_parent(tt->tt_rtport), tport_primaries(master));
+    tport_destroy(master);
+
+#if defined(IP_FREEBIND)
+    /* One address the host does not have yet (192.0.2.0/24 is for
+       documentation): the transport is bound all the same */
+    TEST_1(master = listen_master(tt, "192.0.2.77", NULL, to));
+    TEST_1(!tport_is_wildcard(tport_primaries(master)));
+    tport_destroy(master);
+#endif
+  }
+#endif
+
+  msg_destroy(tt->tt_rmsg), tt->tt_rmsg = NULL;
+
+  END();
+}
+
 int pending_server_close, pending_client_close;
 
 void server_closed_callback(tp_stack_t *tt, tp_client_t *client,
@@ -1012,7 +1254,6 @@ static int test_incomplete(tp_test_t *tt)
 
   su_addrinfo_t const *ai = tt->tt_tcp_addr;
   su_socket_t s;
-  int connected;
 
   TEST_1(ai != NULL);
 
@@ -1022,7 +1263,7 @@ static int test_incomplete(tp_test_t *tt)
   TEST_1(s != SOCKET_ERROR);
 
   su_setblocking(s, 1);
-  connected = connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen);
+  (void)connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen);
 
   su_root_step(tt->tt_root, 50);
 
@@ -1686,12 +1927,14 @@ int main(int argc, char *argv[])
     retval |= sigcomp_test(tt); fflush(stdout);
     retval |= sctp_test(tt); fflush(stdout);
     retval |= udp_test(tt); fflush(stdout);
+    retval |= listen_test(tt); fflush(stdout);
     retval |= tcp_test(tt); fflush(stdout);
     retval |= test_incomplete(tt); fflush(stdout);
     retval |= reuse_test(tt); fflush(stdout);
     retval |= tls_test(tt); fflush(stdout);
-    if (0)			/* Not yet working... */
+    if (0) {			/* Not yet working... */
       retval |= stun_test(tt); fflush(stdout);
+    }
     retval |= deinit_test(tt); fflush(stdout);
   }
 

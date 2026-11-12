@@ -40,6 +40,7 @@ version advances — releases here are **2.0.x**, read from the top-level
 | **Listening on every address** | A wildcard bind (`sip:*`, `sip:0.0.0.0`, `sip:[::]`) opens **one socket per transport, bound to the wildcard address**. Upstream binds one socket per local address, from a list taken when the stack starts. Here an interface can be created or destroyed, an address added, removed or changed, and several interfaces can carry the same address: the stack serves whatever the host has when a packet arrives, with nothing to bind again. |
 | **Several local addresses** | Each message has its own local address. A **response leaves from the address its request arrived on** (RFC 3581 section 4). A **request leaves from the address its peer talks to** (the one its registration or its dialog arrived on), otherwise from the one the routing table picks, and its `Via` names that address. This also covers an interface with more than one address. |
 | **Listening scope** | A transport listens on every address, on **one address** (bound even before the host has it, and still bound after it is removed and added again) or on **named interfaces** only: `;interface=eth0,tun0` in the bind URL, or `TPTAG_INTERFACE()`. Interfaces are matched by name each time, so one that is created later, or destroyed and created again, is served. |
+| **IPv4 and IPv6 together** | `sip:*` binds both address families on one port. A request to an IPv6 destination is sent on the IPv6 transport. Before, with both families bound, a destination written in brackets was not taken for IPv6: the IPv4 socket was used and the request ended with an internal 503. |
 
 The full history is in the [releases](https://github.com/garacil/sofia-sip/releases).
 
@@ -81,7 +82,7 @@ The release version lives in the top-level [`.version`](.version) file and is
 read by `configure` (`AC_INIT`), so cutting a release is a one-line edit plus a
 re-run of `./autogen.sh` and `./configure`. The API-series header directory
 (`sofia-sip-1.13`) and the library soname (`libsofia-sip-ua.so.0.6.0`) are held
-stable across the whole 2.0.x line, so `pkg-config --modversion sofia-sip-ua`
+stable across the whole 2.x line, so `pkg-config --modversion sofia-sip-ua`
 advances while consumers keep building unchanged.
 
 ## License

@@ -468,6 +468,9 @@ struct nta_incoming_s
 
   tp_name_t             irq_tpn[1];
   tport_t              *irq_tport;
+  su_sockaddr_t         irq_local[1];        /**< Local address the request
+					      * arrived on (family 0 if
+					      * not known) */
   struct sigcomp_compartment *irq_cc;
   msg_t		       *irq_request;
   msg_t		       *irq_request2;       /**< ACK/CANCEL */
@@ -634,6 +637,9 @@ static int agent_get_params(nta_agent_t *agent, tagi_t *tags);
 /* Transport interface */
 static sip_via_t const *agent_tport_via(tport_t *tport);
 static int outgoing_insert_via(nta_outgoing_t *orq, sip_via_t const *);
+static void agent_name_local(msg_t *msg, sip_t *sip, tport_t *tport,
+			     su_sockaddr_t const *local, int request);
+static void outgoing_set_local(nta_outgoing_t *orq, tport_t *tp);
 static int nta_tpn_by_via(tp_name_t *tpn, sip_via_t const *v, int *using_rport);
 
 static msg_t *nta_msg_create_for_transport(nta_agent_t *agent, int flags,
@@ -2673,6 +2679,103 @@ int outgoing_insert_via(nta_outgoing_t *orq,
   return 0;
 }
 
+/** Name the local address in a message we send.
+ *
+ * A transport bound to the wildcard address serves every local address of
+ * the host and has no address of its own.  Its name, which the agent copies
+ * to its @Via and @Contact headers, is the main local address the host had
+ * when the transport was bound.  A message sent through such a transport
+ * names the address it leaves from instead:
+ * - the @Via of a request (RFC 3261 section 18.1.1);
+ * - a @Contact that carries the name of the transport.  That is the Contact
+ *   the stack built itself; a Contact with any other host is left as the
+ *   application wrote it.
+ *
+ * A transport whose bind URL gave it a name (sip:name;maddr=0.0.0.0) keeps
+ * that name: the operator chose it.
+ *
+ * @param local   the address the message leaves from
+ * @param request true for a request, false for a response
+ */
+static
+void agent_name_local(msg_t *msg, sip_t *sip, tport_t *tport,
+		      su_sockaddr_t const *local, int request)
+{
+  sip_via_t const *tv;
+  sip_contact_t *m;
+  char host[TPORT_HOSTPORTSIZE];
+  char const *name;
+
+  if (!tport_is_wildcard(tport) || tport_is_named(tport))
+    return;
+
+  tv = agent_tport_via(tport_parent(tport));
+  if (tv == NULL || tv->v_host == NULL)
+    return;
+
+  if (!tport_hostport(host, sizeof host, local, 0))
+    return;
+
+  if (su_casematch(host, tv->v_host))
+    return;			/* The message leaves from the main address */
+
+  name = NULL;
+
+  if (request) {
+    sip_via_t *v = sip->sip_via;
+
+    if (v && v->v_host && su_casematch(v->v_host, tv->v_host)) {
+      if (!(name = su_strdup(msg_home(msg), host)))
+	return;
+      v->v_host = name;
+      msg_fragment_clear(v->v_common);
+    }
+  }
+  else if (sip->sip_status == NULL ||
+	   sip->sip_status->st_status >= 300 ||
+	   sip->sip_cseq == NULL ||
+	   sip->sip_cseq->cs_method == sip_method_register) {
+    /* Contacts of a 3XX-6XX response are alternative targets, and those of
+     * a response to REGISTER are the bindings of the registered client. */
+    return;
+  }
+
+  for (m = sip->sip_contact; m; m = m->m_next) {
+    if (m->m_url->url_host == NULL ||
+	!su_casematch(m->m_url->url_host, tv->v_host))
+      continue;
+    if (!name && !(name = su_strdup(msg_home(msg), host)))
+      return;
+    m->m_url->url_host = name;
+    msg_fragment_clear(m->m_common);
+  }
+}
+
+/** Decide the local address a request leaves from.
+ *
+ * It is stored in the message: a datagram is sent from it, and the @Via
+ * names it.
+ */
+static
+void outgoing_set_local(nta_outgoing_t *orq, tport_t *tp)
+{
+  msg_t *msg = orq->orq_request;
+  sip_t *sip = sip_object(msg);
+  su_sockaddr_t local[1];
+
+  if (!sip || !tport_is_wildcard(tp))
+    return;
+
+  if (tport_source_address(tp, orq->orq_tpn, local) < 0)
+    return;
+
+  msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local));
+
+  /* A @Via the application wrote is not ours to rename */
+  if (!orq->orq_user_via)
+    agent_name_local(msg, sip, tp, local, 1);
+}
+
 /** Get destination name from @Via.
  *
  * If @a using_rport is non-null, try rport.
@@ -3831,6 +3934,14 @@ int mreply(nta_agent_t *agent,
 
     if (retry_without_rport)
       tpn->tpn_port = sip_via_port(sip->sip_via, NULL);
+
+    if (req_msg) {
+      /* The response leaves from the address the request arrived on */
+      su_sockaddr_t local[1];
+
+      if (msg_get_local_address(req_msg, local, NULL) == 0)
+	msg_set_local_address(reply, local, SU_SOCKADDR_SIZE(local));
+    }
 
     if (tport && tpn->tpn_comp) {
       tl_gets(ta_args(ta), TPTAG_COMPARTMENT_REF(cc),
@@ -5508,6 +5619,11 @@ nta_incoming_t *incoming_create(nta_agent_t *agent,
     irq->irq_home = home = msg_home(msg_ref_create(msg));
     irq->irq_agent = agent;
 
+    /* A transport bound to the wildcard address serves every local address:
+     * remember which one this request was sent to, the responses have to
+     * leave from it (RFC 3581 section 4). */
+    msg_get_local_address(msg, irq->irq_local, NULL);
+
     irq->irq_received = agent_now(agent); /* Timestamp originally from tport */
 
     irq->irq_method = method;
@@ -6859,6 +6975,13 @@ int incoming_reply(nta_incoming_t *irq, msg_t *msg, sip_t *sip)
     }
 
     if (sending) {
+      /* The response leaves from the address the request arrived on */
+      if (irq->irq_local->su_family) {
+	msg_set_local_address(msg, irq->irq_local,
+			      SU_SOCKADDR_SIZE(irq->irq_local));
+	agent_name_local(msg, sip, irq->irq_tport, irq->irq_local, 0);
+      }
+
       for (i = 0; i < 3; i++) {
 	tp = tport_tsend(irq->irq_tport, msg, tpn,
 			 IF_SIGCOMP_TPTAG_COMPARTMENT(irq->irq_cc)
@@ -8304,6 +8427,8 @@ outgoing_send_via(nta_outgoing_t *orq, tport_t *tp)
     outgoing_reply(orq, 503, "Cannot insert Via", 1);
     return;
   }
+
+  outgoing_set_local(orq, tp);
 
 #if HAVE_SOFIA_SMIME
   {

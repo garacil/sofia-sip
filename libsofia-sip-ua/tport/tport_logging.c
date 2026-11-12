@@ -487,6 +487,7 @@ int tport_capt_msg_hepv2 (tport_t const *self, msg_t *msg, size_t n,
 
    int buflen = 0;
    su_sockaddr_t const *su, *su_self, *su_self_ext;
+   su_sockaddr_t su_local[1];
    struct hep_hdr hep_header;
    struct hep_timehdr hep_time = {0};    
    su_time_t now;
@@ -505,7 +506,10 @@ int tport_capt_msg_hepv2 (tport_t const *self, msg_t *msg, size_t n,
    assert(self); assert(msg);
 
    su = msg_addr(msg);
-   su_self = self->tp_pri->pri_primary->tp_addr;
+   /* The address this message arrived on or leaves from: the primary may
+      be bound to the wildcard address */
+   tport_local_address(self, msg, su_local);
+   su_self = su_local;
 
    mr = self->tp_master;
    capt_bufsize = mr->mr_capt_bufsize;
@@ -635,6 +639,7 @@ int tport_capt_msg_hepv3 (tport_t const *self, msg_t *msg, size_t n,
 {
 
    su_sockaddr_t const *su, *su_self, *su_self_ext;
+   su_sockaddr_t su_local[1];
    struct hep_generic *hg=NULL;
    unsigned int buflen=0, iplen=0,tlen=0, payload_len = 0;
    su_time_t now;
@@ -652,7 +657,10 @@ int tport_capt_msg_hepv3 (tport_t const *self, msg_t *msg, size_t n,
    assert(self); assert(msg);
 
    su = msg_addr(msg);
-   su_self = self->tp_pri->pri_primary->tp_addr;
+   /* The address this message arrived on or leaves from: the primary may
+      be bound to the wildcard address */
+   tport_local_address(self, msg, su_local);
+   su_self = su_local;
 
    mr = self->tp_master;
    capt_bufsize = mr->mr_capt_bufsize;

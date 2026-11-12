@@ -54,6 +54,11 @@ SOFIAPUBFUN int msg_set_address(msg_t *msg, su_sockaddr_t const *, socklen_t);
 
 SOFIAPUBFUN void msg_addr_copy(msg_t *dst, msg_t const *src);
 
+SOFIAPUBFUN int msg_get_local_address(msg_t *msg, su_sockaddr_t *,
+				      socklen_t *);
+SOFIAPUBFUN int msg_set_local_address(msg_t *msg, su_sockaddr_t const *,
+				      socklen_t);
+
 SOFIAPUBFUN int msg_errno(msg_t const *msg);
 SOFIAPUBFUN void msg_set_errno(msg_t *msg, int err);
 

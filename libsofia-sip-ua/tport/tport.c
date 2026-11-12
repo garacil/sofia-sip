@@ -833,6 +833,7 @@ tport_primary_t *tport_listen(tport_master_t *mr,
 
   pri->pri_primary->tp_has_connection = 0;
   pri->pri_wildcard = SU_SOCKADDR_INADDR_ANY(pri->pri_primary->tp_addr) != 0;
+  pri->pri_named = tpn->tpn_canon != NULL;
 
   SU_DEBUG_5(("%s(%p): %s " TPN_FORMAT "%s\n",
 	      __func__, (void *)pri, "listening at",
@@ -1175,6 +1176,37 @@ void tport_set_local(tport_t *self)
     return;			/* Not connected yet */
 
   memcpy(self->tp_local, su, sizeof self->tp_local);
+}
+
+/** Get the local address of a message on a transport. @internal
+ *
+ * The answer is the best the transport knows, in this order: the local
+ * address stored in the message (the address a datagram was sent to, or the
+ * address it is to be sent from), the local address of the connection, the
+ * address the primary transport is bound to.  The last one is the wildcard
+ * address when the primary serves every local address.
+ *
+ * The port is the port of the connection or of the primary.
+ */
+void tport_local_address(tport_t const *self, msg_t *msg, su_sockaddr_t su[1])
+{
+  tport_t const *pri = self->tp_pri->pri_primary;
+  su_sockaddr_t local[1];
+
+  if (tport_is_secondary(self) && self->tp_local->su_family) {
+    memcpy(su, self->tp_local, sizeof su[0]);
+    return;
+  }
+
+  memset(su, 0, sizeof su[0]);
+  memcpy(su, pri->tp_addr,
+	 pri->tp_addrlen < sizeof su[0] ? pri->tp_addrlen : sizeof su[0]);
+
+  if (msg && msg_get_local_address(msg, local, NULL) == 0) {
+    in_port_t port = su->su_port;
+    memcpy(su, local, sizeof su[0]);
+    su->su_port = port;
+  }
 }
 
 /** Register a new secondary transport. @internal */
@@ -3168,6 +3200,17 @@ void tport_deliver(tport_t *self,
   d->d_msg = msg;
   *d->d_from = *self->tp_name;
 
+  if (msg_get_local_address(msg, NULL, NULL) < 0) {
+    /* The message did not come with its own local address (a datagram to a
+     * socket bound to the wildcard address does): it is the address of the
+     * connection, or the address the primary is bound to. */
+    su_sockaddr_t local[1];
+
+    tport_local_address(self, NULL, local);
+    if (!SU_SOCKADDR_INADDR_ANY(local))
+      msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local));
+  }
+
   if (tport_is_primary(self)) {
     su_sockaddr_t const *su = msg_addr(msg);
 
@@ -4702,6 +4745,52 @@ static int tport_primary_same_kind(tport_t const *a, tport_t const *b)
     su_casematch(a->tp_protoname, b->tp_protoname);
 }
 
+/** Ask the routing table which source address it picks towards @a dst.
+ *
+ * connect() on a datagram socket does the route lookup and sends nothing.
+ *
+ * @retval 0 when @a local has the source address (its port is not set)
+ * @retval -1 upon an error, errno is set
+ */
+static int tport_route_source(su_sockaddr_t const *dst, socklen_t dstlen,
+			      su_sockaddr_t local[1])
+{
+  su_sockaddr_t peer[1];
+  socklen_t locallen = (socklen_t)sizeof local[0];
+  su_socket_t s;
+  int error;
+
+  memset(peer, 0, sizeof peer);
+  memcpy(peer, dst, dstlen);
+  if (peer->su_port == 0)
+    peer->su_port = htons(5060);	/* the route does not depend on it */
+
+  s = su_socket(dst->su_family, SOCK_DGRAM, 0);
+  if (s == INVALID_SOCKET)
+    return -1;
+
+  memset(local, 0, sizeof local[0]);
+
+  if (connect(s, &peer->su_sa, dstlen) < 0 ||
+      getsockname(s, &local->su_sa, &locallen) < 0) {
+    error = su_errno();
+    su_close(s);
+    su_seterrno(error);
+    return -1;
+  }
+
+  su_close(s);
+
+  if (local->su_family != dst->su_family) {
+    su_seterrno(EAFNOSUPPORT);
+    return -1;
+  }
+
+  local->su_port = 0;
+
+  return 0;
+}
+
 /** Get the primary bound to the address the kernel would use as the source
  *  towards @a dst.
  *
@@ -4722,9 +4811,7 @@ static tport_t const *tport_primary_by_route(tport_t const *self,
 {
   tport_primary_t const *pri;
   tport_t const *tp;
-  su_sockaddr_t peer[1], local[1];
-  socklen_t locallen = (socklen_t)sizeof local;
-  su_socket_t s;
+  su_sockaddr_t local[1];
   char addr[SU_ADDRSIZE];
   int n = 0;
 
@@ -4735,27 +4822,11 @@ static tport_t const *tport_primary_by_route(tport_t const *self,
   if (n < 2)
     return NULL;
 
-  memset(peer, 0, sizeof peer);
-  memcpy(peer, dst, dstlen);
-  if (peer->su_port == 0)
-    peer->su_port = htons(5060);	/* the route does not depend on it */
-
-  s = su_socket(dst->su_family, SOCK_DGRAM, 0);
-  if (s == INVALID_SOCKET) {
-    SU_DEBUG_3(("tport(%p): route lookup: socket: %s\n",
-		(void *)self, su_strerror(su_errno())));
-    return NULL;
-  }
-  memset(local, 0, sizeof local);
-  if (connect(s, &peer->su_sa, dstlen) < 0 ||
-      getsockname(s, &local->su_sa, &locallen) < 0 ||
-      local->su_family != dst->su_family) {
+  if (tport_route_source(dst, dstlen, local) < 0) {
     SU_DEBUG_3(("tport(%p): route lookup: %s\n",
 		(void *)self, su_strerror(su_errno())));
-    su_close(s);
     return NULL;
   }
-  su_close(s);
 
   for (pri = self->tp_master->mr_primaries; pri; pri = pri->pri_next) {
     tp = pri->pri_primary;
@@ -4861,6 +4932,122 @@ static tport_t const *tport_secondary_by_name(tport_t const *pri,
   }
 
   return NULL;
+}
+
+/** Test if the transport serves every local address of the host.
+ *
+ * A primary transport bound to the wildcard address, or a connection of
+ * such a primary.
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+int tport_is_wildcard(tport_t const *self)
+{
+  return self && self->tp_pri && self->tp_pri->pri_wildcard;
+}
+
+/** Test if the bind URL gave the transport a name of its own.
+ *
+ * A named transport puts that name in the messages it sends.  A transport
+ * that serves every local address and has no name of its own names the local
+ * address each message leaves from, see tport_source_address().
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+int tport_is_named(tport_t const *self)
+{
+  return self && self->tp_pri && self->tp_pri->pri_named;
+}
+
+/** Get the local address a message to @a tpn is sent from.
+ *
+ * - A connection: its own local address.
+ * - A primary bound to one address: that address.
+ * - A primary bound to the wildcard address: the address the routing table
+ *   picks towards the destination.  The destination has to be numeric.
+ *
+ * The port is the local port of the connection or of the primary.
+ *
+ * @retval 0 when @a su has the address
+ * @retval -1 when it is not known
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+int tport_source_address(tport_t const *self, tp_name_t const *tpn,
+			 su_sockaddr_t su[1])
+{
+  tport_t const *pri;
+  su_sockaddr_t dst[1];
+  socklen_t dstlen;
+  char const *host;
+#if SU_HAVE_IN6
+  char *end, ipaddr[TPORT_HOSTPORTSIZE];
+#endif
+
+  if (self == NULL || su == NULL || self->tp_pri == NULL)
+    return -1;
+
+  if (tport_is_secondary(self) && self->tp_local->su_family) {
+    memcpy(su, self->tp_local, sizeof su[0]);
+    return 0;
+  }
+
+  pri = self->tp_pri->pri_primary;
+
+  if (!self->tp_pri->pri_wildcard) {
+    if (pri->tp_addr->su_family == 0)
+      return -1;
+    memset(su, 0, sizeof su[0]);
+    memcpy(su, pri->tp_addr,
+	   pri->tp_addrlen < sizeof su[0] ? pri->tp_addrlen : sizeof su[0]);
+    return 0;
+  }
+
+  if (tpn == NULL || tpn->tpn_host == NULL)
+    return -1;
+
+  host = tpn->tpn_host;
+  memset(dst, 0, sizeof dst);
+
+#if SU_HAVE_IN6
+  if (host_is_ip6_reference(host)) {
+    /* Remove [] around IPv6 address */
+    host = strncpy(ipaddr, host + 1, sizeof(ipaddr) - 1);
+    ipaddr[sizeof(ipaddr) - 1] = '\0';
+    if ((end = strchr(host, ']')))
+      *end = 0;
+    dst->su_len = dstlen = (socklen_t)sizeof (struct sockaddr_in6);
+    dst->su_family = AF_INET6;
+  }
+  else if (host_is_ip6_address(host)) {
+    dst->su_len = dstlen = (socklen_t)sizeof (struct sockaddr_in6);
+    dst->su_family = AF_INET6;
+  }
+  else
+#endif
+  {
+    dst->su_len = dstlen = (socklen_t)sizeof (struct sockaddr_in);
+    dst->su_family = AF_INET;
+  }
+
+  if (dst->su_family != pri->tp_addr->su_family)
+    return -1;
+
+  if (su_inet_pton(dst->su_family, host, SU_ADDR(dst)) <= 0)
+    return -1;			/* Not resolved yet */
+
+  if (tpn->tpn_port)
+    dst->su_port = htons(strtoul(tpn->tpn_port, NULL, 10));
+
+  if (tport_route_source(dst, dstlen, su) < 0) {
+    SU_DEBUG_5(("tport(%p): route lookup to %s: %s\n",
+		(void *)self, tpn->tpn_host, su_strerror(su_errno())));
+    return -1;
+  }
+
+  su->su_port = pri->tp_addr->su_port;
+
+  return 0;
 }
 
 /** Get transport by name.

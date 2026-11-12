@@ -50,6 +50,19 @@
 #include <errno.h>
 #include <limits.h>
 
+/* The local address of a datagram, when the socket is bound to the wildcard
+ * address: read with each datagram received, and set with each datagram sent
+ * from a chosen address. */
+#if defined(IP_PKTINFO) && (!SU_HAVE_IN6 || defined(IPV6_PKTINFO))
+#define TPORT_UDP_PKTINFO 1
+#else
+#define TPORT_UDP_PKTINFO 0
+#endif
+
+#if TPORT_UDP_PKTINFO
+#include <sched.h>
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* UDP */
 
@@ -143,6 +156,26 @@ int tport_udp_init_primary(tport_primary_t *pri,
     return -1;
 
   tport_set_tos(s, ai, pri->pri_params->tpp_tos);
+
+#if TPORT_UDP_PKTINFO
+  if (SU_SOCKADDR_INADDR_ANY((su_sockaddr_t *)ai->ai_addr)) {
+    /* The socket serves every local address: ask for the address each
+     * datagram was sent to, so that it can be answered from that address. */
+    int error = 0;
+
+    if (ai->ai_family == AF_INET)
+      error = setsockopt(s, IPPROTO_IP, IP_PKTINFO, (void *)&one, sizeof one);
+#if SU_HAVE_IN6
+    else if (ai->ai_family == AF_INET6)
+      error = setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+			 (void *)&one, sizeof one);
+#endif
+    if (error < 0)
+      SU_DEBUG_3(("setsockopt(%s): %s\n",
+		  ai->ai_family == AF_INET ? "IP_PKTINFO" : "IPV6_RECVPKTINFO",
+		  su_strerror(su_errno())));
+  }
+#endif
 
 #if HAVE_IP_ADD_MEMBERSHIP
   if (ai->ai_family == AF_INET &&
@@ -280,6 +313,147 @@ static void tport_check_trunc(tport_t *tp, su_addrinfo_t *ai)
 #endif
 }
 
+#if TPORT_UDP_PKTINFO
+/** Receive a datagram together with the local address it was sent to.
+ *
+ * @param local  the local address, family 0 if the kernel did not tell it
+ */
+static
+ssize_t tport_udp_recv_at(tport_t const *self,
+			  msg_iovec_t iov[], size_t iovlen,
+			  su_sockaddr_t *from, socklen_t *fromlen,
+			  su_sockaddr_t local[1])
+{
+  struct msghdr hdr[1] = {{0}};
+  struct cmsghdr *c;
+  union {
+    struct cmsghdr align;
+    char data[256];
+  } control;
+  ssize_t n;
+
+  hdr->msg_name = (void *)from;
+  hdr->msg_namelen = *fromlen;
+  hdr->msg_iov = (struct iovec *)iov;
+  hdr->msg_iovlen = iovlen;
+  hdr->msg_control = control.data;
+  hdr->msg_controllen = sizeof control.data;
+
+  n = recvmsg(self->tp_socket, hdr, 0);
+  if (n < 0)
+    return n;
+
+  *fromlen = hdr->msg_namelen;
+
+  for (c = CMSG_FIRSTHDR(hdr); c; c = CMSG_NXTHDR(hdr, c)) {
+    if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+      struct in_pktinfo info;
+
+      memcpy(&info, CMSG_DATA(c), sizeof info);
+
+      local->su_len = sizeof local->su_sin;
+      local->su_family = AF_INET;
+      /* ipi_spec_dst is the address to answer from: the destination of the
+       * datagram, or a unicast address of ours when that was a broadcast or
+       * multicast address. */
+      if (info.ipi_spec_dst.s_addr)
+	local->su_sin.sin_addr = info.ipi_spec_dst;
+      else
+	local->su_sin.sin_addr = info.ipi_addr;
+    }
+#if SU_HAVE_IN6
+    else if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_PKTINFO) {
+      struct in6_pktinfo info;
+
+      memcpy(&info, CMSG_DATA(c), sizeof info);
+
+      local->su_len = sizeof local->su_sin6;
+      local->su_family = AF_INET6;
+      local->su_sin6.sin6_addr = info.ipi6_addr;
+      if (IN6_IS_ADDR_LINKLOCAL(&info.ipi6_addr))
+	local->su_sin6.sin6_scope_id = info.ipi6_ifindex;
+    }
+#endif
+  }
+
+  return n;
+}
+
+/** Send a datagram from the local address @a local.
+ *
+ * The interface index is left to the routing table: only the source address
+ * is chosen.
+ */
+static
+ssize_t tport_udp_send_from(tport_t const *self,
+			    msg_iovec_t iov[], size_t iovused,
+			    su_sockaddr_t const *to, socklen_t tolen,
+			    su_sockaddr_t const *local)
+{
+  struct msghdr hdr[1] = {{0}};
+  struct cmsghdr *c;
+  union {
+    struct cmsghdr align;
+    char data[CMSG_SPACE(sizeof(struct in_pktinfo)) +
+	      CMSG_SPACE(sizeof(struct in6_pktinfo))];
+  } control;
+  ssize_t n;
+  int sanity = 100;
+
+  memset(&control, 0, sizeof control);
+
+  hdr->msg_name = (void *)to;
+  hdr->msg_namelen = tolen;
+  hdr->msg_iov = (struct iovec *)iov;
+  hdr->msg_iovlen = iovused;
+  hdr->msg_control = control.data;
+
+  if (local->su_family == AF_INET) {
+    struct in_pktinfo info;
+
+    memset(&info, 0, sizeof info);
+    info.ipi_spec_dst = local->su_sin.sin_addr;
+
+    hdr->msg_controllen = CMSG_SPACE(sizeof info);
+    c = CMSG_FIRSTHDR(hdr);
+    c->cmsg_level = IPPROTO_IP;
+    c->cmsg_type = IP_PKTINFO;
+    c->cmsg_len = CMSG_LEN(sizeof info);
+    memcpy(CMSG_DATA(c), &info, sizeof info);
+  }
+#if SU_HAVE_IN6
+  else if (local->su_family == AF_INET6) {
+    struct in6_pktinfo info;
+
+    memset(&info, 0, sizeof info);
+    info.ipi6_addr = local->su_sin6.sin6_addr;
+    if (IN6_IS_ADDR_LINKLOCAL(&info.ipi6_addr))
+      info.ipi6_ifindex = local->su_sin6.sin6_scope_id;
+
+    hdr->msg_controllen = CMSG_SPACE(sizeof info);
+    c = CMSG_FIRSTHDR(hdr);
+    c->cmsg_level = IPPROTO_IPV6;
+    c->cmsg_type = IPV6_PKTINFO;
+    c->cmsg_len = CMSG_LEN(sizeof info);
+    memcpy(CMSG_DATA(c), &info, sizeof info);
+  }
+#endif
+  else {
+    su_seterrno(EAFNOSUPPORT);
+    return -1;
+  }
+
+  /* As su_vsend() does */
+  do {
+    n = sendmsg(self->tp_socket, hdr, MSG_NOSIGNAL);
+    if (n == -1 && errno == EAGAIN)
+      sched_yield();
+  } while (--sanity > 0 && n == -1 && (errno == EAGAIN || errno == EINTR));
+
+  return n;
+}
+#endif
+
 /** Receive datagram.
  *
  * @retval -1 error
@@ -335,6 +509,17 @@ int tport_recv_dgram(tport_t *self)
   ai = msg_addrinfo(msg);
   from = (su_sockaddr_t *)ai->ai_addr, fromlen = (socklen_t)(ai->ai_addrlen);
 
+#if TPORT_UDP_PKTINFO
+  if (self->tp_pri->pri_wildcard) {
+    su_sockaddr_t local[1];
+
+    memset(local, 0, sizeof local);
+    n = tport_udp_recv_at(self, iovec, veclen, from, &fromlen, local);
+    if (n != SOCKET_ERROR)
+      msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local));
+  }
+  else
+#endif
   n = su_vrecv(self->tp_socket, iovec, veclen, 0, from, &fromlen);
 
   ai->ai_addrlen = fromlen;
@@ -410,6 +595,41 @@ ssize_t tport_send_dgram(tport_t const *self, msg_t *msg,
 #endif
 
   su_soerror(self->tp_socket); /* XXX - we *still* have a race condition */
+
+#if TPORT_UDP_PKTINFO
+  if (self->tp_pri->pri_wildcard) {
+    su_sockaddr_t local[1];
+
+    if (msg_get_local_address(msg, local, NULL) == 0 &&
+	local->su_family == self->tp_addrinfo->ai_family) {
+      ssize_t n = tport_udp_send_from(self, iov, iovused, su, sulen, local);
+      int error;
+
+      if (n != -1)
+	return n;
+
+      error = su_errno();
+      if (error != ENETUNREACH && error != EINVAL && error != EADDRNOTAVAIL)
+	return -1;
+
+      /* The kernel refuses the source address: it may not be an address of
+       * this host any longer.  If the datagram goes out without it, that
+       * was the reason, and the routing table chooses from now on. */
+      n = su_vsend(self->tp_socket, iov, iovused, MSG_NOSIGNAL, su, sulen);
+      if (n != -1) {
+	char addr[SU_ADDRSIZE];
+	SU_DEBUG_5(("%s(%p): cannot send from %s (%s), "
+		    "sent from the address the route picks\n",
+		    __func__, (void *)self,
+		    su_inet_ntop(local->su_family, SU_ADDR(local),
+				 addr, sizeof addr),
+		    su_strerror(error)));
+	msg_set_local_address(msg, NULL, 0);
+      }
+      return n;
+    }
+  }
+#endif
 
   return su_vsend(self->tp_socket, iov, iovused, MSG_NOSIGNAL, su, sulen);
 }

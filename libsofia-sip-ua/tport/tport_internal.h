@@ -279,6 +279,7 @@ struct tport_primary {
   unsigned            pri_has_tls:1;	/**< Supports tls  */
   unsigned            pri_wildcard:1;	/**< Bound to the wildcard address:
 					 * serves every local address */
+  unsigned            pri_named:1;	/**< The bind URL gave it a name */
   unsigned:0;
 
   void               *pri_stun_handle;
@@ -440,6 +441,7 @@ tport_t *tport_alloc_secondary(tport_primary_t *pri,
 int tport_accept(tport_primary_t *pri, int events);
 int tport_register_secondary(tport_t *self, su_wakeup_f wakeup, int events);
 void tport_set_local(tport_t *self);
+void tport_local_address(tport_t const *self, msg_t *msg, su_sockaddr_t su[1]);
 void tport_zap_secondary(tport_t *self);
 
 int tport_set_secondary_timer(tport_t *self);

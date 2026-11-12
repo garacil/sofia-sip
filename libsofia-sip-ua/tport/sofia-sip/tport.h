@@ -330,6 +330,16 @@ TPORT_DLL tport_t *tport_primary_by_name(tport_t const *self, tp_name_t const *t
 /** Get a transport corresponding to the name */
 TPORT_DLL tport_t *tport_by_name(tport_t const *self, tp_name_t const  *);
 
+/** Test if the transport serves every local address of the host. */
+TPORT_DLL int tport_is_wildcard(tport_t const *self);
+
+/** Test if the bind URL gave the transport a name of its own. */
+TPORT_DLL int tport_is_named(tport_t const *self);
+
+/** Get the local address a message to a destination is sent from. */
+TPORT_DLL int tport_source_address(tport_t const *self, tp_name_t const *tpn,
+				   su_sockaddr_t su[1]);
+
 /** Create a transport name corresponding to the URL. */
 TPORT_DLL int tport_name_by_url(su_home_t *, tp_name_t *,
 				url_string_t const *us);

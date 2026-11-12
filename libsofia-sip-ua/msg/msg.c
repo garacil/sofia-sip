@@ -243,6 +243,7 @@ msg_mclass_t const *msg_mclass(msg_t const *msg)
 void msg_addr_zero(msg_t *msg)
 {
   memset(&msg->m_addr, 0, sizeof(msg->m_addr));
+  memset(&msg->m_local, 0, sizeof(msg->m_local));
   memset(&msg->m_addrinfo, 0, sizeof(msg->m_addrinfo));
 
   msg->m_addrinfo.ai_addrlen = sizeof(msg->m_addr);
@@ -352,6 +353,92 @@ void msg_addr_copy(msg_t *dst, msg_t const *src)
   if (dst->m_addrinfo.ai_addrlen < sizeof(dst->m_addr))
     memset((char *)dst->m_addr + dst->m_addrinfo.ai_addrlen, 0,
 	   sizeof(dst->m_addr) - dst->m_addrinfo.ai_addrlen);
+  memcpy(dst->m_local, src->m_local, sizeof(dst->m_local));
+}
+
+/** Get local address of the message.
+ *
+ * @relatesalso msg_s
+ *
+ * The local address of a received message is the address it arrived on:
+ * the destination address of the datagram, or the local address of the
+ * connection.  A transport bound to the wildcard address serves every local
+ * address of the host, so the address is known per message only.
+ *
+ * The local address of a message to be sent is the address it is sent from,
+ * when msg_set_local_address() has set one.
+ *
+ * @param msg pointer to msg object
+ * @param su pointer to socket address structure (may be NULL)
+ * @param return_len value-result parameter for the length
+ *                   of the socket address structure (may be NULL)
+ *
+ * @retval 0 when the local address is known
+ * @retval -1 when it is not known
+ *
+ * @sa msg_set_local_address(), msg_get_address(), msg_addr_copy().
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+int msg_get_local_address(msg_t *msg, su_sockaddr_t *su, socklen_t *return_len)
+{
+  socklen_t len;
+
+  if (msg == NULL || msg->m_local->su_family == 0)
+    return -1;
+
+  len = (socklen_t)SU_SOCKADDR_SIZE(msg->m_local);
+
+  if (return_len) {
+    if (*return_len < len)
+      return -1;
+    *return_len = len;
+  }
+
+  if (su)
+    memcpy(su, msg->m_local, len);
+
+  return 0;
+}
+
+/** Set local address of the message.
+ *
+ * @relatesalso msg_s
+ *
+ * A message sent with a datagram transport bound to the wildcard address
+ * leaves from the local address set here.  Without one, the routing table
+ * chooses the source address.  The port is not used.
+ *
+ * @param msg pointer to msg object
+ * @param su pointer to socket address structure, or NULL to clear the
+ *           local address
+ * @param sulen length of socket address structure
+ *
+ * @retval 0 when successful
+ * @retval -1 upon an error
+ *
+ * @sa msg_get_local_address(), msg_set_address(), msg_addr_copy().
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+int msg_set_local_address(msg_t *msg, su_sockaddr_t const *su, socklen_t sulen)
+{
+  if (msg == NULL)
+    return -1;
+
+  memset(msg->m_local, 0, sizeof(msg->m_local));
+
+  if (su == NULL || su->su_family == 0)
+    return 0;
+
+  if (sulen > sizeof(msg->m_local) || sulen < (socklen_t)SU_SOCKADDR_SIZE(su)) {
+    msg->m_errno = EFAULT;
+    return -1;
+  }
+
+  memcpy(msg->m_local, su, SU_SOCKADDR_SIZE(su));
+
+  return 0;
 }
 
 

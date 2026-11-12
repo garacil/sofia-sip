@@ -99,6 +99,9 @@ struct msg_s {
 
   su_addrinfo_t	 m_addrinfo;	/**< Message addressing info (protocol) */
   su_sockaddr_t	 m_addr[1];	/**< Message address */
+  su_sockaddr_t	 m_local[1];	/**< Local address: where the message arrived,
+				 * or where it is to be sent from
+				 * (family 0 when not known) */
 
   int          	 m_errno;	/**< Errno */
 };

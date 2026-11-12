@@ -320,6 +320,19 @@ s2_sip_respond_to(struct message *m, struct dialog *d,
 
   *tpn = *tport_name(m->tport);
 
+  if (tport_is_primary(m->tport)) {
+    /* A datagram: the response goes to the address the request came from.
+     * The name of the transport is our own, and a transport bound to the
+     * wildcard address is named after the main address of the host, which
+     * is not where a request to another local address (or to the other
+     * address family) came from. */
+    char host[TPORT_HOSTPORTSIZE];
+
+    if (tport_hostport(host, sizeof host,
+		       (su_sockaddr_t *)msg_addrinfo(m->msg)->ai_addr, 0))
+      tpn->tpn_canon = tpn->tpn_host = su_strdup(home, host);
+  }
+
   rport = su_sprintf(home, "rport=%u",
 		     ntohs(((su_sockaddr_t *)
 			    msg_addrinfo(m->msg)->ai_addr)->su_port));

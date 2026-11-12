@@ -318,6 +318,80 @@ START_TEST(client_2_0_4)
 }
 END_TEST
 
+START_TEST(client_2_0_5)
+{
+  nta_outgoing_t *orq;
+  struct message *request;
+  struct event *response;
+  char *route;
+  char addr[SU_ADDRSIZE];
+
+  S2_CASE("client-2.0.5", "Send MESSAGE to an IPv6 address",
+	  "With IPv4 and IPv6 both bound, a request to an IPv6 destination "
+	  "leaves on the IPv6 transport");
+
+#if SU_HAVE_IN6 && defined(__linux__)
+  {
+    /* Not on a host without IPv6 */
+    su_socket_t s = su_socket(AF_INET6, SOCK_DGRAM, 0);
+    su_sockaddr_t su[1];
+    int usable;
+
+    memset(su, 0, sizeof su);
+    su->su_family = AF_INET6;
+    su->su_sin6.sin6_addr = in6addr_loopback;
+    usable = s != INVALID_SOCKET &&
+      bind(s, &su->su_sa, (socklen_t)(sizeof su->su_sin6)) == 0;
+    if (s != INVALID_SOCKET)
+      su_close(s);
+    if (!usable)
+      return;
+  }
+
+  /* An agent on both families: the fixture binds IPv4 only */
+  s2_nta_teardown();
+  s2_nta_setup("NTA", NULL, TAG_END());
+  s2_nta_agent_setup(URL_STRING_MAKE("sip:*:*"), NULL, NULL,
+		     NTATAG_DEFAULT_PROXY("sip:example.org"),
+		     TAG_END());
+
+  route = su_sprintf(NULL, "sip:[::1]:%s", s2sip->contact->m_url->url_port);
+  fail_unless(route != NULL);
+
+  orq = nta_outgoing_tcreate(s2->default_leg,
+			     s2_nta_orq_callback, NULL,
+			     (url_string_t *)route,
+			     SIP_METHOD_MESSAGE,
+			     URL_STRING_MAKE("sip:test2.0.example.org"),
+			     SIPTAG_FROM_STR("<sip:client@example.net>"),
+			     TAG_END());
+  fail_unless(orq != NULL);
+
+  /* The destination comes in brackets, as in a URL. Taken for no family
+     at all, the first transport was used: the IPv4 one, on which the send
+     fails, and the transaction ended with 503 at once. */
+  request = s2_sip_wait_for_request(SIP_METHOD_MESSAGE);
+  fail_unless(request != NULL);
+
+  fail_unless(message_address(request->msg, 1, addr) != NULL);
+  fail_unless(strcmp(addr, "::1") == 0);
+  fail_unless(message_address(request->msg, 0, addr) != NULL);
+  fail_unless(strcmp(addr, "::1") == 0);
+  fail_unless(request->sip->sip_via != NULL);
+  fail_unless(strcmp(request->sip->sip_via->v_host, "[::1]") == 0);
+
+  s2_sip_respond_to(request, NULL, 200, "2.0.5", TAG_END());
+  response = s2_nta_wait_for(wait_for_orq, orq,
+			     wait_for_status, 200,
+			     0);
+  s2_sip_free_message(request);
+  s2_nta_free_event(response);
+  nta_outgoing_destroy(orq);
+  su_free(NULL, route);
+#endif
+}
+END_TEST
+
 TCase *check_nta_client_2_0(void)
 {
   TCase *tc = tcase_create("NTA 2.0 - Client");
@@ -331,6 +405,7 @@ TCase *check_nta_client_2_0(void)
   tcase_add_test(tc, client_2_0_2);
   tcase_add_test(tc, client_2_0_3);
   tcase_add_test(tc, client_2_0_4);
+  tcase_add_test(tc, client_2_0_5);
 
   return tc;
 }

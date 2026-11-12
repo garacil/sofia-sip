@@ -340,6 +340,9 @@ TPORT_DLL int tport_is_named(tport_t const *self);
 TPORT_DLL int tport_source_address(tport_t const *self, tp_name_t const *tpn,
 				   su_sockaddr_t su[1]);
 
+/** Remember the local address the peer of a message talks to. */
+TPORT_DLL void tport_flow_learn(tport_t *self, msg_t *msg);
+
 /** Create a transport name corresponding to the URL. */
 TPORT_DLL int tport_name_by_url(su_home_t *, tp_name_t *,
 				url_string_t const *us);

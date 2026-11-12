@@ -314,6 +314,13 @@ struct tport_master {
   char               *mr_capt_name;	/**< Servername for capturing received/sent data */
   su_addrinfo_t      *mr_capt_src_addr;
   tport_primary_t    *mr_primaries;        /**< List of primary contacts */
+
+  /** Flows: the local address each peer of a wildcard datagram transport
+   * talks to (see tport_flow_learn()). */
+  struct tport_flow **mr_flows;		   /**< Hash table of flows */
+  struct tport_flow  *mr_flow_first;	   /**< Most recently used flow */
+  struct tport_flow  *mr_flow_last;	   /**< Least recently used flow */
+  unsigned            mr_flow_count;	   /**< Number of flows */
   unsigned	      mr_prot_ver;	/* hep version */
   unsigned	      mr_agent_id;      /* agent version */
   unsigned	      mr_capt_bufsize;  /* per-message HEP capture buffer cap (bytes). */
@@ -442,6 +449,7 @@ int tport_accept(tport_primary_t *pri, int events);
 int tport_register_secondary(tport_t *self, su_wakeup_f wakeup, int events);
 void tport_set_local(tport_t *self);
 void tport_local_address(tport_t const *self, msg_t *msg, su_sockaddr_t su[1]);
+void tport_flow_forget(tport_t const *self, su_sockaddr_t const *peer);
 void tport_zap_secondary(tport_t *self);
 
 int tport_set_secondary_timer(tport_t *self);

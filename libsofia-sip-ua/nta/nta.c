@@ -3565,6 +3565,10 @@ void agent_recv_response(nta_agent_t *agent,
   if ((orq = outgoing_find(agent, msg, sip, sip->sip_via))) {
     SU_DEBUG_5(("nta: %03d %s %s\n",
 		status, phrase, "is going to a transaction"));
+
+    /* The peer answers our request: it talks to the local address this
+     * response arrived on, and later requests to it leave from there. */
+    tport_flow_learn(tport, msg);
       /* RFC3263 4.3 "503 error response" */
       if(agent->sa_srv_503 && status == 503 && outgoing_other_destinations(orq)) {
               SU_DEBUG_5(("%s(%p): <%03d> for <%s>, %s\n", "nta", (void *)orq, status, method, "try next after timeout"));
@@ -7015,6 +7019,18 @@ int incoming_reply(nta_incoming_t *irq, msg_t *msg, sip_t *sip)
 
       agent->sa_stats->as_sent_msg++;
       agent->sa_stats->as_sent_response++;
+
+      if (200 <= status && status < 300 && !irq->irq_default &&
+	  (irq->irq_method == sip_method_register ||
+	   irq->irq_method == sip_method_invite ||
+	   irq->irq_method == sip_method_subscribe ||
+	   irq->irq_method == sip_method_refer))
+	/* The application accepted a request that creates a binding or a
+	 * dialog: its sender talks to the local address the request arrived
+	 * on, and requests to it leave from there.  Requests that anybody
+	 * gets a 2XX to (OPTIONS) teach nothing, or a spoofed one could move
+	 * the address used towards somebody else. */
+	tport_flow_learn(tp, msg);
     }
 
     SU_DEBUG_5(("nta: %s %u %s for %s (%u)\n",

@@ -4934,6 +4934,268 @@ static tport_t const *tport_secondary_by_name(tport_t const *pri,
   return NULL;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Flows of a datagram transport bound to the wildcard address */
+
+/**@internal
+ * A flow: a peer and the local address it talks to.
+ *
+ * A socket bound to the wildcard address can send a datagram from any local
+ * address.  A request to a peer has to leave from the address that peer
+ * talks to: its NAT binding, or its idea of who we are, is for that address
+ * and no other.  The routing table cannot tell which one it is when an
+ * interface has several addresses, so the transport remembers it.  It is
+ * what a connection is for the stream transports (RFC 5626 section 3 calls
+ * both a flow).
+ */
+struct tport_flow {
+  struct tport_flow *tf_next;		/**< Next in the hash bucket */
+  struct tport_flow *tf_newer, *tf_older; /**< Links in usage order */
+  su_sockaddr_t      tf_peer[1];	/**< Remote address and port */
+  su_sockaddr_t      tf_local[1];	/**< Local address (no port) */
+};
+
+enum {
+  /** Size of the hash table of flows */
+  TPORT_FLOW_BUCKETS = 8192,
+  /** Maximum number of flows.  A flow that is not known only means that the
+   * routing table chooses the source address, as it does for a new peer. */
+  TPORT_FLOW_MAX = 65536
+};
+
+static unsigned tport_flow_hash(su_sockaddr_t const *su)
+{
+  unsigned char const *p = (unsigned char const *)SU_ADDR(su);
+  size_t i, n = SU_ADDRLEN(su);
+  unsigned hash = 2166136261U;
+
+  for (i = 0; i < n; i++)
+    hash = (hash ^ p[i]) * 16777619U;
+  hash = (hash ^ (su->su_port & 0xff)) * 16777619U;
+  hash = (hash ^ ((su->su_port >> 8) & 0xff)) * 16777619U;
+
+  return hash % TPORT_FLOW_BUCKETS;
+}
+
+static int tport_flow_is_peer(struct tport_flow const *tf,
+			      su_sockaddr_t const *su)
+{
+  return
+    tf->tf_peer->su_family == su->su_family &&
+    tf->tf_peer->su_port == su->su_port &&
+    memcmp(SU_ADDR(tf->tf_peer), SU_ADDR(su), SU_ADDRLEN(su)) == 0;
+}
+
+static void tport_flow_unlink(tport_master_t *mr, struct tport_flow *tf)
+{
+  if (tf->tf_newer)
+    tf->tf_newer->tf_older = tf->tf_older;
+  else
+    mr->mr_flow_first = tf->tf_older;
+
+  if (tf->tf_older)
+    tf->tf_older->tf_newer = tf->tf_newer;
+  else
+    mr->mr_flow_last = tf->tf_newer;
+
+  tf->tf_newer = tf->tf_older = NULL;
+}
+
+static void tport_flow_first(tport_master_t *mr, struct tport_flow *tf)
+{
+  tf->tf_newer = NULL;
+  tf->tf_older = mr->mr_flow_first;
+  if (mr->mr_flow_first)
+    mr->mr_flow_first->tf_newer = tf;
+  else
+    mr->mr_flow_last = tf;
+  mr->mr_flow_first = tf;
+}
+
+static struct tport_flow *tport_flow_find(tport_master_t *mr,
+					  su_sockaddr_t const *peer,
+					  struct tport_flow ***return_prev)
+{
+  struct tport_flow *tf, **prev;
+
+  if (mr->mr_flows == NULL)
+    return NULL;
+
+  for (prev = &mr->mr_flows[tport_flow_hash(peer)];
+       (tf = *prev);
+       prev = &tf->tf_next) {
+    if (tport_flow_is_peer(tf, peer)) {
+      if (return_prev)
+	*return_prev = prev;
+      return tf;
+    }
+  }
+
+  return NULL;
+}
+
+static void tport_flow_free(tport_master_t *mr, struct tport_flow *tf,
+			    struct tport_flow **prev)
+{
+  *prev = tf->tf_next;
+  tport_flow_unlink(mr, tf);
+  su_free(mr->mr_home, tf);
+  mr->mr_flow_count--;
+}
+
+/** Test if @a su is an address a flow can have. */
+static int tport_flow_is_address(su_sockaddr_t const *su)
+{
+  if (su->su_family != AF_INET
+#if SU_HAVE_IN6
+      && su->su_family != AF_INET6
+#endif
+      )
+    return 0;
+
+  return !SU_SOCKADDR_INADDR_ANY(su);
+}
+
+/** Remember the local address the peer of a message talks to.
+ *
+ * The peer is the address of the message (where it came from, or where it
+ * was sent), and the local address is the local address of the message
+ * (where it arrived, or where it was sent from).  Later requests to that
+ * peer through a datagram transport bound to the wildcard address leave
+ * from the same local address, see tport_source_address().
+ *
+ * The caller decides which messages prove that the peer is there: a spoofed
+ * request must not be able to change the address used towards somebody
+ * else.  The transaction layer calls this for a response that matches one
+ * of its client transactions, and for a 2XX response it sends to a request
+ * that creates a binding or a dialog.
+ *
+ * Nothing is remembered for other kinds of transport: a connection is its
+ * own flow, and a transport bound to one address has one address.
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+void tport_flow_learn(tport_t *self, msg_t *msg)
+{
+  tport_master_t *mr;
+  struct tport_flow *tf, **prev;
+  su_sockaddr_t const *peer;
+  su_sockaddr_t local[1];
+
+  if (self == NULL || msg == NULL || self->tp_pri == NULL)
+    return;
+
+  if (!self->tp_pri->pri_wildcard || !tport_is_dgram(self))
+    return;
+
+  mr = self->tp_master;
+  peer = msg_addr(msg);
+
+  if (msg_get_local_address(msg, local, NULL) < 0)
+    return;
+  if (!tport_flow_is_address(peer) || !tport_flow_is_address(local) ||
+      peer->su_family != local->su_family || peer->su_port == 0)
+    return;
+
+  local->su_port = 0;
+
+  if ((tf = tport_flow_find(mr, peer, NULL))) {
+    memcpy(tf->tf_local, local, sizeof tf->tf_local);
+    tport_flow_unlink(mr, tf);
+    tport_flow_first(mr, tf);
+    return;
+  }
+
+  if (mr->mr_flows == NULL) {
+    mr->mr_flows = su_zalloc(mr->mr_home,
+			     TPORT_FLOW_BUCKETS * (sizeof mr->mr_flows[0]));
+    if (mr->mr_flows == NULL)
+      return;
+  }
+
+  if (mr->mr_flow_count >= TPORT_FLOW_MAX && mr->mr_flow_last) {
+    /* Forget the flow that has gone unused the longest */
+    tf = tport_flow_find(mr, mr->mr_flow_last->tf_peer, &prev);
+    assert(tf == mr->mr_flow_last);
+    if (tf)
+      tport_flow_free(mr, tf, prev);
+  }
+
+  tf = su_zalloc(mr->mr_home, sizeof *tf);
+  if (tf == NULL)
+    return;
+
+  memcpy(tf->tf_peer, peer, SU_SOCKADDR_SIZE(peer));
+  memcpy(tf->tf_local, local, sizeof tf->tf_local);
+
+  prev = &mr->mr_flows[tport_flow_hash(peer)];
+  tf->tf_next = *prev, *prev = tf;
+  tport_flow_first(mr, tf);
+  mr->mr_flow_count++;
+}
+
+/** Forget the flow of a peer. @internal
+ *
+ * Its local address is not an address of this host any longer.
+ */
+void tport_flow_forget(tport_t const *self, su_sockaddr_t const *peer)
+{
+  tport_master_t *mr = self->tp_master;
+  struct tport_flow *tf, **prev;
+
+  if (peer && tport_flow_is_address(peer) &&
+      (tf = tport_flow_find(mr, peer, &prev)))
+    tport_flow_free(mr, tf, prev);
+}
+
+/** Get the local address of the flow of a peer.
+ *
+ * @retval 0 when @a local has it (its port is not set)
+ * @retval -1 when the peer has no flow
+ */
+static int tport_flow_local(tport_master_t *mr, su_sockaddr_t const *peer,
+			    su_sockaddr_t local[1])
+{
+  struct tport_flow *tf = tport_flow_find(mr, peer, NULL);
+
+  if (tf == NULL)
+    return -1;
+
+  memcpy(local, tf->tf_local, sizeof local[0]);
+
+  if (tf != mr->mr_flow_first) {
+    tport_flow_unlink(mr, tf);
+    tport_flow_first(mr, tf);
+  }
+
+  return 0;
+}
+
+/** Test if @a su is an address of this host now.
+ *
+ * Only a local address can be bound.
+ */
+static int tport_is_local_address(su_sockaddr_t const *su)
+{
+  su_sockaddr_t local[1];
+  su_socket_t s;
+  int bound;
+
+  memset(local, 0, sizeof local);
+  memcpy(local, su, SU_SOCKADDR_SIZE(su));
+  local->su_port = 0;
+
+  s = su_socket(su->su_family, SOCK_DGRAM, 0);
+  if (s == INVALID_SOCKET)
+    return 0;
+
+  bound = bind(s, &local->su_sa, SU_SOCKADDR_SIZE(local)) == 0;
+
+  su_close(s);
+
+  return bound;
+}
+
 /** Test if the transport serves every local address of the host.
  *
  * A primary transport bound to the wildcard address, or a connection of
@@ -4963,8 +5225,13 @@ int tport_is_named(tport_t const *self)
  *
  * - A connection: its own local address.
  * - A primary bound to one address: that address.
- * - A primary bound to the wildcard address: the address the routing table
- *   picks towards the destination.  The destination has to be numeric.
+ * - A datagram primary bound to the wildcard address: the address the peer
+ *   talks to, when tport_flow_learn() has learnt it.
+ * - Otherwise, a primary bound to the wildcard address: the address the
+ *   routing table picks towards the destination.
+ *
+ * The destination has to be numeric for a primary bound to the wildcard
+ * address.
  *
  * The port is the local port of the connection or of the primary.
  *
@@ -5039,7 +5306,18 @@ int tport_source_address(tport_t const *self, tp_name_t const *tpn,
   if (tpn->tpn_port)
     dst->su_port = htons(strtoul(tpn->tpn_port, NULL, 10));
 
-  if (tport_route_source(dst, dstlen, su) < 0) {
+  if (tport_is_dgram(pri) && dst->su_port != 0 &&
+      tport_flow_local(self->tp_master, dst, su) == 0) {
+    /* The address this peer talks to, as long as it is still ours */
+    if (!tport_is_local_address(su)) {
+      tport_flow_forget(self, dst);
+      su->su_family = 0;
+    }
+  }
+  else
+    su->su_family = 0;
+
+  if (su->su_family == 0 && tport_route_source(dst, dstlen, su) < 0) {
     SU_DEBUG_5(("tport(%p): route lookup to %s: %s\n",
 		(void *)self, tpn->tpn_host, su_strerror(su_errno())));
     return -1;

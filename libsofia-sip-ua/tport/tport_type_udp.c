@@ -625,6 +625,7 @@ ssize_t tport_send_dgram(tport_t const *self, msg_t *msg,
 				 addr, sizeof addr),
 		    su_strerror(error)));
 	msg_set_local_address(msg, NULL, 0);
+	tport_flow_forget(self, su);
       }
       return n;
     }

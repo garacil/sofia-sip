@@ -4879,7 +4879,13 @@ tport_t *tport_primary_by_name(tport_t const *tp, tp_name_t const *tpn)
   if (tpn->tpn_host == NULL)
     family = 0;
 #if SU_HAVE_IN6
-  else if (host_is_ip6_address(tpn->tpn_host))
+  /* The host of a transport name is written as in a URL: an IPv6 address
+   * comes in brackets.  Taken for "no family", the first primary of the
+   * protocol was returned, and with IPv4 and IPv6 both bound that is the
+   * IPv4 one: a message to an IPv6 destination was sent on the IPv4 socket
+   * and failed with EAFNOSUPPORT. */
+  else if (host_is_ip6_address(tpn->tpn_host) ||
+	   host_is_ip6_reference(tpn->tpn_host))
     family = AF_INET6;
 #endif
   else if (host_is_ip4_address(tpn->tpn_host))

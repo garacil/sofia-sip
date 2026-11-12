@@ -455,10 +455,10 @@ int tport_server_addrinfo(tport_master_t *mr,
 			  char const * const transports[],
 			  su_addrinfo_t **res);
 
-static int tport_get_local_addrinfo(tport_master_t *mr,
-				    char const *port,
-				    su_addrinfo_t const *hints,
-				    su_addrinfo_t **return_ai);
+static int tport_get_wildcard_addrinfo(tport_master_t *mr,
+				       char const *port,
+				       su_addrinfo_t const *hints,
+				       su_addrinfo_t **return_ai);
 
 int tport_getaddrinfo(char const *node, char const *service,
 		      su_addrinfo_t const *hints,
@@ -832,10 +832,12 @@ tport_primary_t *tport_listen(tport_master_t *mr,
   }
 
   pri->pri_primary->tp_has_connection = 0;
+  pri->pri_wildcard = SU_SOCKADDR_INADDR_ANY(pri->pri_primary->tp_addr) != 0;
 
-  SU_DEBUG_5(("%s(%p): %s " TPN_FORMAT "\n",
+  SU_DEBUG_5(("%s(%p): %s " TPN_FORMAT "%s\n",
 	      __func__, (void *)pri, "listening at",
-	      TPN_ARGS(pri->pri_primary->tp_name)));
+	      TPN_ARGS(pri->pri_primary->tp_name),
+	      pri->pri_wildcard ? " (any local address)" : ""));
 
   return pri;
 }
@@ -846,6 +848,19 @@ int tport_bind_socket(int socket,
 {
   su_sockaddr_t *su = (su_sockaddr_t *)ai->ai_addr;
   socklen_t sulen = (socklen_t)(ai->ai_addrlen);
+
+#if SU_HAVE_IN6 && defined(IPV6_V6ONLY)
+  if (ai->ai_family == AF_INET6 && SU_SOCKADDR_INADDR_ANY(su)) {
+    /* The IPv6 wildcard socket takes IPv6 only: IPv4 has a wildcard socket
+     * of its own on the same port, and the two could not be bound together
+     * otherwise. */
+    int const one = 1;
+    if (setsockopt(socket, IPPROTO_IPV6, IPV6_V6ONLY,
+		   (void *)&one, sizeof one) == -1)
+      SU_DEBUG_3(("%s: setsockopt(IPV6_V6ONLY): %s\n",
+		  __func__, su_strerror(su_errno())));
+  }
+#endif
 
   if (bind(socket, ai->ai_addr, sulen) == -1) {
     return *return_culprit = "bind", -1;
@@ -1128,6 +1143,40 @@ tport_t *tport_base_connect(tport_primary_t *pri,
   return self;
 }
 
+/** Store the local address of a connection. @internal
+ *
+ * A listener bound to the wildcard address accepts connections to any local
+ * address, and a connection opened from it leaves from the address the
+ * routing table picks: only the connected socket knows which one it is.
+ */
+void tport_set_local(tport_t *self)
+{
+  su_sockaddr_t su[1];
+  socklen_t sulen = (socklen_t)(sizeof su);
+
+  if (!tport_is_secondary(self) || self->tp_socket == INVALID_SOCKET)
+    return;
+
+  memset(su, 0, sizeof su);
+
+  if (getsockname(self->tp_socket, &su->su_sa, &sulen) == SOCKET_ERROR)
+    return;
+
+  SU_CANONIZE_SOCKADDR(su);
+
+  if (su->su_family != AF_INET
+#if SU_HAVE_IN6
+      && su->su_family != AF_INET6
+#endif
+      )
+    return;
+
+  if (SU_SOCKADDR_INADDR_ANY(su))
+    return;			/* Not connected yet */
+
+  memcpy(self->tp_local, su, sizeof self->tp_local);
+}
+
 /** Register a new secondary transport. @internal */
 int tport_register_secondary(tport_t *self, su_wakeup_f wakeup, int events)
 {
@@ -1148,6 +1197,8 @@ int tport_register_secondary(tport_t *self, su_wakeup_f wakeup, int events)
 
     self->tp_index = i;
     self->tp_events = events;
+
+    tport_set_local(self);
 
     tprb_append(&self->tp_pri->pri_open, self);
 
@@ -1785,6 +1836,7 @@ int tport_bind_server(tport_master_t *mr,
 	case EADDRNOTAVAIL:	/* Not our address */
 	case ENOPROTOOPT:	/* Protocol not supported */
 	case ESOCKTNOSUPPORT:	/* Socket type not supported */
+	case EAFNOSUPPORT:	/* Address family not supported */
 	  continue;
 	default:
 	  if (port0 != 0) {
@@ -1943,47 +1995,39 @@ int tport_server_addrinfo(tport_master_t *mr,
     return 0;
   }
 
-  return tport_get_local_addrinfo(mr, service, hints, return_addrinfo);
+  return tport_get_wildcard_addrinfo(mr, service, hints, return_addrinfo);
 }
 
-/** Return true if two local addresses are the same address (port ignored).
+/** Return one wildcard address per transport and address family.
  *
- * IPv6 addresses also compare their scope (a link-local address is distinct
- * on each interface).
+ * A wildcard host ("*", "0.0.0.0", "::") is listened on with one socket per
+ * transport bound to the wildcard address of each family, not with one
+ * socket per local address.  The local addresses of a host change while the
+ * stack runs (interfaces are created and destroyed, addresses are added and
+ * removed, several interfaces can carry the same address), and a socket
+ * bound to the wildcard address serves whichever addresses the host has when
+ * a datagram or a connection arrives.
  */
 static
 int
-tport_local_addr_is_same(su_sockaddr_t const *a, su_sockaddr_t const *b)
+tport_get_wildcard_addrinfo(tport_master_t *mr,
+			    char const *port,
+			    su_addrinfo_t const *hints,
+			    su_addrinfo_t **return_ai)
 {
-  if (a->su_family != b->su_family)
-    return 0;
-  if (a->su_family == AF_INET)
-    return a->su_sin.sin_addr.s_addr == b->su_sin.sin_addr.s_addr;
+  static int const families[] = {
+    AF_INET,
 #if SU_HAVE_IN6
-  if (a->su_family == AF_INET6)
-    return memcmp(&a->su_sin6.sin6_addr, &b->su_sin6.sin6_addr,
-		  sizeof a->su_sin6.sin6_addr) == 0 &&
-      a->su_sin6.sin6_scope_id == b->su_sin6.sin6_scope_id;
+    AF_INET6,
 #endif
-  return 0;
-}
-
-/** Convert localinfo into addrinfo */
-static
-int
-tport_get_local_addrinfo(tport_master_t *mr,
-			 char const *port,
-			 su_addrinfo_t const *hints,
-			 su_addrinfo_t **return_ai)
-{
-  int error, family;
-  su_localinfo_t lihints[1] = {{ 0 }};
-  su_localinfo_t *li, *li_result;
+    0
+  };
   su_addrinfo_t const *h;
   su_addrinfo_t *ai, **prev;
   su_sockaddr_t *su;
   unsigned long lport = 0;
   char *rest;
+  int i;
 
   prev = return_ai, *prev = NULL;
 
@@ -1995,92 +2039,48 @@ tport_get_local_addrinfo(tport_master_t *mr,
     }
   }
 
-  family = hints->ai_family;
-
-  for (h = hints->ai_next; h && family; h = h->ai_next)
-    if (h->ai_family != family)
-      family = 0;
-
-  lihints->li_flags = 0;
-  lihints->li_family = family;
-  lihints->li_scope = LI_SCOPE_GLOBAL | LI_SCOPE_SITE | LI_SCOPE_HOST;
-
-  error = su_getlocalinfo(lihints, &li_result);
-  if (error) {
-#if SU_HAVE_IN6
-    SU_DEBUG_3(("%s(%p): su_getlocalinfo() for %s address: %s\n",
-		__func__, (void *)mr,
-		family == AF_INET6 ? "ip6"
-		: family == AF_INET ? "ip4" : "ip",
-		su_gli_strerror(error)));
-#else
-    SU_DEBUG_3(("%s(%p): su_getlocalinfo() for %s address: %s\n",
-		__func__, (void *)mr,
-		family == AF_INET ? "ip4" : "ip",
-		su_gli_strerror(error)));
-#endif
-    su_seterrno(ENOENT);
-    return -1;
-  }
-
-  for (li = li_result; li; li = li->li_next) {
+  for (i = 0; families[i]; i++) {
     for (h = hints; h; h = h->ai_next) {
-      su_addrinfo_t *seen;
-      char buf[SU_ADDRSIZE];
+      socklen_t sulen;
 
-      if (h->ai_family && h->ai_family != li->li_family)
+      if (h->ai_family && h->ai_family != families[i])
 	continue;
 
-      /* One listener per local address and transport. Several interfaces can
-       * carry the same address (point-to-point tunnels sharing their local
-       * end): su_getlocalinfo() lists it once per address entry, and binding
-       * it a second time would fail with EADDRINUSE and make the whole
-       * wildcard bind fail. */
-      for (seen = *return_ai; seen; seen = seen->ai_next) {
-	if (seen->ai_family == li->li_family &&
-	    seen->ai_socktype == h->ai_socktype &&
-	    seen->ai_protocol == h->ai_protocol &&
-	    su_strmatch(seen->ai_canonname, h->ai_canonname) &&
-	    tport_local_addr_is_same((su_sockaddr_t *)seen->ai_addr,
-				     li->li_addr))
-	  break;
-      }
-      if (seen) {
-	SU_DEBUG_5(("%s(%p): %s %s listed more than once, listened on once\n",
-		    __func__, (void *)mr,
-		    h->ai_canonname ? h->ai_canonname : "*",
-		    su_inet_ntop(li->li_family, SU_ADDR(li->li_addr),
-				 buf, sizeof buf)));
-	continue;
-      }
+#if SU_HAVE_IN6
+      if (families[i] == AF_INET6)
+	sulen = (socklen_t)(sizeof su->su_sin6);
+      else
+#endif
+	sulen = (socklen_t)(sizeof su->su_sin);
 
-      ai = calloc(1, sizeof *ai + li->li_addrlen);
-      if (ai == NULL)
-	break;
+      /* Room for any socket address: the entry is filled through su_sockaddr_t */
+      ai = calloc(1, sizeof *ai + sizeof *su);
+      if (ai == NULL) {
+	tport_freeaddrinfo(*return_ai), *return_ai = NULL;
+	su_seterrno(ENOMEM);
+	return -1;
+      }
 
       *prev = ai, prev = &ai->ai_next;
 
       ai->ai_flags = AI_PASSIVE | TP_AI_ANY;
-      ai->ai_family = li->li_family;
+      ai->ai_family = families[i];
       ai->ai_socktype = h->ai_socktype;
       ai->ai_protocol = h->ai_protocol;
       ai->ai_canonname = h->ai_canonname;
-      ai->ai_addr = memcpy(ai + 1, li->li_addr,
-			   ai->ai_addrlen = li->li_addrlen);
+      ai->ai_addr = (void *)(ai + 1), ai->ai_addrlen = sulen;
+
+      /* The zeroed address is the wildcard address of the family */
       su = (void *)ai->ai_addr;
+      su->su_len = sulen;
+      su->su_family = families[i];
       su->su_port = htons(lport);
     }
   }
 
-  su_freelocalinfo(li_result);
-
-  if (li) {
-    tport_freeaddrinfo(*return_ai);
-    su_seterrno(ENOMEM);
-    return -1;
-  }
-
   if (*return_ai == NULL) {
+    SU_DEBUG_3(("%s(%p): no address family to listen on\n",
+		__func__, (void *)mr));
     su_seterrno(ENOENT);
     return -1;
   }
@@ -2879,6 +2879,7 @@ static int tport_connected(su_root_magic_t *magic, su_wait_t *w, tport_t *self)
   }
 
   self->tp_is_connected = 1;
+  tport_set_local(self);
 
   su_root_deregister(mr->mr_root, self->tp_index);
   self->tp_index = -1;

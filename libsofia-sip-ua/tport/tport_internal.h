@@ -207,6 +207,8 @@ struct tport_s {
   su_addrinfo_t       tp_addrinfo[1];   /**< Peer/own address info */
   su_sockaddr_t       tp_addr[1];	/**< Peer/own address */
 #define tp_addrlen tp_addrinfo->ai_addrlen
+  su_sockaddr_t       tp_local[1];	/**< Local address of a connection
+					 * (family 0 until it is known) */
 
   /* ==== Receive queue ================================================== */
 
@@ -275,6 +277,8 @@ struct tport_primary {
   unsigned            pri_updating:1;   /**< Currently updating address */
   unsigned            pri_natted:1;	/**< Using natted address  */
   unsigned            pri_has_tls:1;	/**< Supports tls  */
+  unsigned            pri_wildcard:1;	/**< Bound to the wildcard address:
+					 * serves every local address */
   unsigned:0;
 
   void               *pri_stun_handle;
@@ -435,6 +439,7 @@ tport_t *tport_alloc_secondary(tport_primary_t *pri,
 
 int tport_accept(tport_primary_t *pri, int events);
 int tport_register_secondary(tport_t *self, su_wakeup_f wakeup, int events);
+void tport_set_local(tport_t *self);
 void tport_zap_secondary(tport_t *self);
 
 int tport_set_secondary_timer(tport_t *self);

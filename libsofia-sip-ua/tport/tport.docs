@@ -107,6 +107,50 @@ be associated with a transport (e.g., a Via header). The protocol stack
 can change the type of transport magic by defining the macro
 #TP_MAGIC_T before including <sofia-sip/tport.h>.
 
+@section tp_listen Listening Addresses
+
+The host part of the transport name given to tport_tbind() decides what a
+server transport listens on.
+
+@par Every Local Address
+
+The wildcard host ("*", "0.0.0.0" for IPv4 only, "::" for IPv6 only) binds
+one socket per transport protocol to the wildcard address of each address
+family. The transport then serves every address the host has when a datagram
+or a connection arrives: an interface can be created or destroyed, an address
+added, removed or changed, and several interfaces can carry the same address,
+with nothing to bind again. tport_is_wildcard() is true for such a transport.
+
+Such a transport has no address of its own, so each message carries one:
+- msg_get_local_address() gives the address a received message arrived on:
+  the destination of the datagram, or the local address of the connection.
+- A datagram whose message got an address with msg_set_local_address() is
+  sent from that address. A reply should be sent from the address its request
+  arrived on (RFC 3581 section 4). Without an address, the routing table
+  picks the source.
+- tport_source_address() tells which address a new message to a destination
+  leaves from: the local address of the connection, the address the peer
+  talks to when tport_flow_learn() has learnt it, or else the address the
+  routing table picks.
+
+The name of the transport (tport_name()) is the main address the host had
+when the transport was bound. The transport user should name the address a
+message really leaves from instead, unless the transport was given a name of
+its own (tport_is_named()).
+
+@par One Address
+
+A numeric host binds that address only. The socket is bound even if the host
+does not have the address yet, and it stays bound while the address, or its
+interface, is removed and created again.
+
+@par Named Interfaces
+
+TPTAG_INTERFACE() restricts a transport to network interfaces given by name.
+Only what arrives on one of them is processed. The interfaces are matched by
+name each time, so an interface that is created later, or destroyed and
+created again, is served as soon as it is there.
+
 @section tp_op Transport Operations
 
 @subsection tp_send Sending Messages

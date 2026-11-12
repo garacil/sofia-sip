@@ -2164,12 +2164,17 @@ static tport_stack_class_t nta_agent_class[1] =
  * over SCTP.
  *
  * The "host" part determines what address/domain name is used in @Contact.
- * An "*" in "host" part is shorthand for any local IP address. 0.0.0.0
- * means that the only the IPv4 addresses are used. [::] means that only
- * the IPv6 addresses are used. If a domain name or a specific IP address
- * is given as "host" part, an additional "maddr" parameter can be used to
- * control which addresses are used by the stack when binding listen
- * sockets for incoming requests.
+ * An "*" in "host" part means every local IP address: the stack binds one
+ * socket per transport to the wildcard address, and serves whichever
+ * addresses the host has when a message arrives. 0.0.0.0 means that only
+ * IPv4 is used, [::] that only IPv6 is. The @Via of each request, and a
+ * @Contact the stack builds itself, then name the address the message
+ * leaves from, and a response leaves from the address its request arrived
+ * on. A specific IP address is bound even if the host does not have it yet.
+ * If a domain name or a specific IP address is given as "host" part, an
+ * additional "maddr" parameter can be used to control which addresses are
+ * used by the stack when binding listen sockets for incoming requests; the
+ * "host" part is then the name used in @Via and @Contact.
  *
  * The "port" determines what port is used in contact, and to which port the
  * stack binds in order to listen for incoming requests. Empty or missing
@@ -2185,9 +2190,9 @@ static tport_stack_class_t nta_agent_class[1] =
  * preferred to UDP.
  *
  * The "maddr" parameter determines to which address the stack binds in
- * order to listen for incoming requests. An "*" in "maddr" parameter is
- * shorthand for any local IP address. 0.0.0.0 means that only IPv4 sockets
- * are created. [::] means that only IPv6 sockets are created.
+ * order to listen for incoming requests. An "*" in "maddr" parameter means
+ * every local IP address. 0.0.0.0 means that only IPv4 sockets are created.
+ * [::] means that only IPv6 sockets are created.
  *
  * The "interface" parameter restricts the transport to the named network
  * interfaces: one name, or several separated by commas.  Only what arrives
@@ -2199,6 +2204,7 @@ static tport_stack_class_t nta_agent_class[1] =
  * @par Examples:
  * @code sip:172.21.40.24;maddr=* @endcode \n
  * @code sip:172.21.40.24:50600;transport=TCP,UDP;comp=sigcomp @endcode \n
+ * @code sip:0.0.0.0:5060;transport=udp,tcp;interface=eth0,tun0 @endcode \n
  * @code sips:* @endcode
  *
  * @return

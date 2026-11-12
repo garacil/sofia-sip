@@ -2189,6 +2189,10 @@ static tport_stack_class_t nta_agent_class[1] =
  * shorthand for any local IP address. 0.0.0.0 means that only IPv4 sockets
  * are created. [::] means that only IPv6 sockets are created.
  *
+ * The "interface" parameter restricts the transport to the named network
+ * interfaces: one name, or several separated by commas.  Only what arrives
+ * on one of them is processed, see TPTAG_INTERFACE().
+ *
  * The "comp" parameter determines the supported compression protocol.
  * Currently only sigcomp is supported (with suitable library).
  *
@@ -2209,6 +2213,8 @@ int nta_agent_add_tport(nta_agent_t *self,
   char tp[32];
   char maddr[256];
   char comp[32];
+  char interfaces[256];
+  char const *ifnames = NULL;
   tp_name_t tpn[1] = {{ NULL }};
   char const * const * tports = tports_sip;
   int error;
@@ -2278,6 +2284,9 @@ int nta_agent_add_tport(nta_agent_t *self,
       tpn->tpn_host = maddr;
     if (url_param(url->url_params, "comp", comp, sizeof(comp)) > 0)
       tpn->tpn_comp = comp;
+    if (url_param(url->url_params, "interface",
+		  interfaces, sizeof(interfaces)) > 0)
+      ifnames = interfaces;
 
     if (tpn->tpn_comp &&
 	(nta_compressor_vtable == NULL ||
@@ -2298,7 +2307,9 @@ int nta_agent_add_tport(nta_agent_t *self,
     }
   }
 
-  if (tport_tbind(self->sa_tports, tpn, tports, ta_tags(ta)) < 0) {
+  if (tport_tbind(self->sa_tports, tpn, tports,
+		  TAG_IF(ifnames, TPTAG_INTERFACE(ifnames)),
+		  ta_tags(ta)) < 0) {
     error = su_errno();
     SU_DEBUG_1(("nta: bind(%s:%s;transport=%s%s%s%s%s): %s\n",
 		tpn->tpn_canon, tpn->tpn_port, tpn->tpn_proto,

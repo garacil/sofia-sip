@@ -56,6 +56,12 @@ TPORT_DLL extern tag_typedef_t tptag_ident;
 TPORT_DLL extern tag_typedef_t tptag_ident_ref;
 #define TPTAG_IDENT_REF(x) tptag_ident_ref, tag_str_vr(&(x))
 
+TPORT_DLL extern tag_typedef_t tptag_interface;
+#define TPTAG_INTERFACE(x) tptag_interface, tag_str_v((x))
+
+TPORT_DLL extern tag_typedef_t tptag_interface_ref;
+#define TPTAG_INTERFACE_REF(x) tptag_interface_ref, tag_str_vr(&(x))
+
 TPORT_DLL extern tag_typedef_t tptag_reuse;
 #define TPTAG_REUSE(x) tptag_reuse, tag_bool_v((x))
 

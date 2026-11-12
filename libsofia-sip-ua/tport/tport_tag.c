@@ -62,6 +62,32 @@ tag_typedef_t tptag_any = NSTAG_TYPEDEF(*);
  */
 tag_typedef_t tptag_ident = CSTRTAG_TYPEDEF(ident);
 
+/**@def TPTAG_INTERFACE(cstr)
+ *
+ * Listen on the named network interfaces only.
+ *
+ * The value is the name of an interface, or several names separated by
+ * commas ("eth0" or "eth0,tun0").  The transport still binds as its URL
+ * says (the wildcard address, usually), and then:
+ * - a datagram is processed only if it arrived on one of the interfaces;
+ * - a connection is accepted only if it arrived on one of them.
+ *
+ * The interfaces are matched by name each time, not by an index taken when
+ * the transport was bound: an interface that does not exist yet, or that is
+ * destroyed and created again, is served as soon as it is there.  Messages
+ * that this host sends to itself arrive on the loopback interface ("lo").
+ *
+ * Sending is not restricted: the routing table chooses the interface.
+ *
+ * The bind URL parameter "interface" of nta_agent_add_tport() sets this tag.
+ *
+ * Use with tport_tbind(), nua_create(), nta_agent_create(),
+ * nta_agent_add_tport(), nth_engine_create(), or initial nth_site_create().
+ *
+ * @since New in sofia-sip 2.1.0.
+ */
+tag_typedef_t tptag_interface = CSTRTAG_TYPEDEF(interface);
+
 /**@def TPTAG_REUSE(boolean)
  *
  * Allow reusing transport connection (true by default).

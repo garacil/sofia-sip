@@ -79,6 +79,10 @@ typedef struct tport_nat_s tport_nat_t;
 #include <sofia-sip/rbtree.h>
 
 #include "tport_internal.h"
+
+#if HAVE_NET_IF_H
+#include <net/if.h>
+#endif
 #include "tport_tls.h"
 #include "tport_ws.h"
 
@@ -501,6 +505,9 @@ void tport_peer_address(tport_t *self, msg_t *msg);
 
 static void tport_parse(tport_t *self, int complete, su_time_t now);
 
+static void tport_set_interfaces(tport_primary_t *pri, tagi_t const *tags);
+static int tport_is_local_address(su_sockaddr_t const *su);
+
 static tport_primary_t *tport_alloc_primary(tport_master_t *mr,
 					    tport_vtable_t const *vtable,
 					    tp_name_t tpn[1],
@@ -668,6 +675,146 @@ void tport_destroy(tport_t *self)
 }
 
 
+/** Read the interfaces a primary is restricted to (TPTAG_INTERFACE()). */
+static void tport_set_interfaces(tport_primary_t *pri, tagi_t const *tags)
+{
+  char const *names = NULL, *n;
+
+  tl_gets(tags, TPTAG_INTERFACE_REF(names), TAG_END());
+
+  pri->pri_nifs = 0;
+
+  for (n = names; n && *n && pri->pri_nifs < TPORT_INTERFACES_MAX; ) {
+    struct tport_interface *ti = &pri->pri_ifs[pri->pri_nifs];
+    size_t len;
+
+    n += strspn(n, ", \t");
+    len = strcspn(n, ", \t");
+    if (len == 0)
+      break;
+
+    if (len < sizeof ti->ti_name) {
+      memcpy(ti->ti_name, n, len), ti->ti_name[len] = '\0';
+      ti->ti_index = 0;
+      pri->pri_nifs++;
+    }
+    else {
+      SU_DEBUG_3(("%s(%p): interface name too long: %.*s\n",
+		  __func__, (void *)pri, (int)len, n));
+    }
+
+    n += len;
+  }
+
+  pri->pri_ifs_checked = 0;
+}
+
+/** Test if something that arrived on interface @a ifindex is for a primary.
+ * @internal
+ *
+ * A primary without TPTAG_INTERFACE() takes everything.  Otherwise the
+ * interface has to be one of those it names.  They are matched by name: the
+ * indexes are read again when the index is not a known one, at most once a
+ * second, so an interface created after the primary was bound, or destroyed
+ * and created again with another index, is served.
+ */
+int tport_on_interface(tport_primary_t *pri, unsigned ifindex)
+{
+  unsigned i;
+  long now;
+
+  if (pri->pri_nifs == 0)
+    return 1;
+
+  if (ifindex == 0)
+    return 0;
+
+  for (i = 0; i < pri->pri_nifs; i++)
+    if (pri->pri_ifs[i].ti_index == ifindex)
+      return 1;
+
+  now = (long)su_now().tv_sec;
+  if (now == pri->pri_ifs_checked)
+    return 0;
+  pri->pri_ifs_checked = now;
+
+#if HAVE_NET_IF_H
+  for (i = 0; i < pri->pri_nifs; i++)
+    pri->pri_ifs[i].ti_index = if_nametoindex(pri->pri_ifs[i].ti_name);
+#endif
+
+  for (i = 0; i < pri->pri_nifs; i++)
+    if (pri->pri_ifs[i].ti_index == ifindex)
+      return 1;
+
+  return 0;
+}
+
+/** Test if an accepted connection arrived on an interface of the primary.
+ * @internal
+ *
+ * The kernel keeps the interface the connection request arrived on, when the
+ * listening socket asked for packet information.
+ */
+int tport_accepted_on_interface(tport_primary_t *pri, su_socket_t s)
+{
+  unsigned ifindex = 0;
+
+  if (pri->pri_nifs == 0)
+    return 1;
+
+#if defined(IP_PKTOPTIONS) && defined(IP_PKTINFO)
+  if (pri->pri_primary->tp_addrinfo->ai_family == AF_INET) {
+    union {
+      struct cmsghdr align;
+      char data[256];
+    } options;
+    socklen_t len = (socklen_t)sizeof options.data;
+    struct msghdr hdr[1] = {{0}};
+    struct cmsghdr *c;
+
+    if (getsockopt(s, IPPROTO_IP, IP_PKTOPTIONS, options.data, &len) == 0) {
+      hdr->msg_control = options.data;
+      hdr->msg_controllen = len;
+      for (c = CMSG_FIRSTHDR(hdr); c; c = CMSG_NXTHDR(hdr, c)) {
+	if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+	  struct in_pktinfo info;
+	  memcpy(&info, CMSG_DATA(c), sizeof info);
+	  ifindex = (unsigned)info.ipi_ifindex;
+	}
+      }
+    }
+  }
+#endif
+#if SU_HAVE_IN6 && defined(IPV6_2292PKTOPTIONS) && defined(IPV6_PKTINFO)
+  if (pri->pri_primary->tp_addrinfo->ai_family == AF_INET6) {
+    union {
+      struct cmsghdr align;
+      char data[256];
+    } options;
+    socklen_t len = (socklen_t)sizeof options.data;
+    struct msghdr hdr[1] = {{0}};
+    struct cmsghdr *c;
+
+    if (getsockopt(s, IPPROTO_IPV6, IPV6_2292PKTOPTIONS,
+		   options.data, &len) == 0) {
+      hdr->msg_control = options.data;
+      hdr->msg_controllen = len;
+      for (c = CMSG_FIRSTHDR(hdr); c; c = CMSG_NXTHDR(hdr, c)) {
+	if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_PKTINFO) {
+	  struct in6_pktinfo info;
+	  memcpy(&info, CMSG_DATA(c), sizeof info);
+	  ifindex = (unsigned)info.ipi6_ifindex;
+	}
+      }
+    }
+  }
+#endif
+
+  /* An interface that cannot be told is not one of ours */
+  return tport_on_interface(pri, ifindex);
+}
+
 /** Allocate a primary transport */
 static
 tport_primary_t *tport_alloc_primary(tport_master_t *mr,
@@ -710,6 +857,9 @@ tport_primary_t *tport_alloc_primary(tport_master_t *mr,
 
   *next = pri;
   tp = pri->pri_primary;
+
+  if (tp)
+    tport_set_interfaces(pri, tags);
 
   if (!tp)
     *return_culprit = "alloc";
@@ -863,8 +1013,38 @@ int tport_bind_socket(int socket,
   }
 #endif
 
+  if ((ai->ai_flags & TP_AI_FREEBIND) && !SU_SOCKADDR_INADDR_ANY(su)) {
+    /* One address: the socket is bound even if the address is not there yet
+     * (its interface is created later), and it stays bound while the address
+     * is removed and added again. */
+    int const one = 1;
+#if defined(IP_FREEBIND)
+    if (ai->ai_family == AF_INET &&
+	setsockopt(socket, IPPROTO_IP, IP_FREEBIND,
+		   (void *)&one, sizeof one) == -1)
+      SU_DEBUG_3(("%s: setsockopt(IP_FREEBIND): %s\n",
+		  __func__, su_strerror(su_errno())));
+#endif
+#if SU_HAVE_IN6 && defined(IPV6_FREEBIND)
+    if (ai->ai_family == AF_INET6 &&
+	setsockopt(socket, IPPROTO_IPV6, IPV6_FREEBIND,
+		   (void *)&one, sizeof one) == -1)
+      SU_DEBUG_3(("%s: setsockopt(IPV6_FREEBIND): %s\n",
+		  __func__, su_strerror(su_errno())));
+#endif
+    (void)one;
+  }
+
   if (bind(socket, ai->ai_addr, sulen) == -1) {
     return *return_culprit = "bind", -1;
+  }
+
+  if ((ai->ai_flags & TP_AI_FREEBIND) && !SU_SOCKADDR_INADDR_ANY(su) &&
+      !tport_is_local_address(su)) {
+    char buf[SU_ADDRSIZE];
+    SU_DEBUG_3(("%s: %s is not an address of this host yet: "
+		"listening on it for when it is\n", __func__,
+		su_inet_ntop(su->su_family, SU_ADDR(su), buf, sizeof buf)));
   }
 
   if (getsockname(socket, &su->su_sa, &sulen) == SOCKET_ERROR) {
@@ -1777,7 +1957,7 @@ int tport_bind_server(tport_master_t *mr,
 {
   char hostname[TPORT_HOSTPORTSIZE];
   char const *canon = NULL, *host, *service;
-  int error = 0, family = 0;
+  int error = 0, family = 0, numeric;
   tport_primary_t *pri = NULL, **tbf;
   su_addrinfo_t *ai, *res = NULL;
   unsigned port, port0, port1, old;
@@ -1823,6 +2003,14 @@ int tport_bind_server(tport_master_t *mr,
       (host || tpn->tpn_canon != tpn->tpn_host))
     canon = tpn->tpn_canon;
 
+  /* One address, given as a number: listen on it even when the host does
+   * not have it yet. */
+  numeric = host && (host_is_ip4_address(host)
+#if SU_HAVE_IN6
+		     || host_is_ip6_address(host)
+#endif
+		     );
+
   if (tport_server_addrinfo(mr, canon, family,
 			    host, service, tpn->tpn_proto,
 			    transports, &res) < 0)
@@ -1854,6 +2042,8 @@ int tport_bind_server(tport_master_t *mr,
       tport_addrinfo_copy(ainfo, su, sizeof su, ai);
       ainfo->ai_canonname = (char *)canon;
       su->su_port = htons(port);
+      if (numeric)
+	ainfo->ai_flags |= TP_AI_FREEBIND;
 
       memcpy(tpname, tpn, sizeof tpname);
       tpname->tpn_canon = canon;
@@ -2801,6 +2991,14 @@ int tport_accept(tport_primary_t *pri, int events)
 
   if (s < 0) {
     tport_error_report(pri->pri_primary, su_errno(), NULL);
+    return 0;
+  }
+
+  if (!tport_accepted_on_interface(pri, s)) {
+    SU_DEBUG_5(("%s(%p): connection refused: "
+		"it did not arrive on an interface of this transport\n",
+		__func__, (void *)pri));
+    su_close(s);
     return 0;
   }
 

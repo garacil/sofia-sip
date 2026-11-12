@@ -152,6 +152,28 @@ int tport_stream_init_primary(tport_primary_t *pri,
   if (tport_bind_socket(socket, ai, return_culprit) == -1)
     return -1;
 
+  if (pri->pri_nifs) {
+    /* The transport listens on some interfaces only: the kernel then keeps,
+     * for each connection, the interface its request arrived on. */
+    int const one = 1;
+    int error = 0;
+
+#if defined(IP_PKTINFO)
+    if (ai->ai_family == AF_INET)
+      error = setsockopt(socket, IPPROTO_IP, IP_PKTINFO,
+			 (void *)&one, sizeof one);
+#endif
+#if SU_HAVE_IN6 && defined(IPV6_RECVPKTINFO)
+    if (ai->ai_family == AF_INET6)
+      error = setsockopt(socket, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+			 (void *)&one, sizeof one);
+#endif
+    if (error < 0)
+      SU_DEBUG_3(("%s(%p): setsockopt(packet information): %s\n",
+		  __func__, (void *)pri, su_strerror(su_errno())));
+    (void)one;
+  }
+
   if (listen(socket, pri->pri_params->tpp_qsize) == SOCKET_ERROR)
     return *return_culprit = "listen", -1;
 

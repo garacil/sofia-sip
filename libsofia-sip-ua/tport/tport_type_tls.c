@@ -583,6 +583,14 @@ int tport_tls_accept(tport_primary_t *pri, int events)
     return 0;
   }
 
+  if (!tport_accepted_on_interface(pri, s)) {
+    SU_DEBUG_5(("%s(%p): connection refused: "
+		"it did not arrive on an interface of this transport\n",
+		__func__, (void *)pri));
+    su_close(s);
+    return 0;
+  }
+
   ai->ai_addr = &su->su_sa, ai->ai_addrlen = sulen;
 
   /* Alloc a new transport object, then register socket events with it */

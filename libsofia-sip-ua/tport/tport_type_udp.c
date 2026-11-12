@@ -158,9 +158,11 @@ int tport_udp_init_primary(tport_primary_t *pri,
   tport_set_tos(s, ai, pri->pri_params->tpp_tos);
 
 #if TPORT_UDP_PKTINFO
-  if (SU_SOCKADDR_INADDR_ANY((su_sockaddr_t *)ai->ai_addr)) {
+  if (SU_SOCKADDR_INADDR_ANY((su_sockaddr_t *)ai->ai_addr) || pri->pri_nifs) {
     /* The socket serves every local address: ask for the address each
-     * datagram was sent to, so that it can be answered from that address. */
+     * datagram was sent to, so that it can be answered from that address.
+     * A transport that listens on some interfaces only asks for it too: it
+     * comes with the interface the datagram arrived on. */
     int error = 0;
 
     if (ai->ai_family == AF_INET)
@@ -174,6 +176,8 @@ int tport_udp_init_primary(tport_primary_t *pri,
       SU_DEBUG_3(("setsockopt(%s): %s\n",
 		  ai->ai_family == AF_INET ? "IP_PKTINFO" : "IPV6_RECVPKTINFO",
 		  su_strerror(su_errno())));
+    else
+      pri->pri_pktinfo = 1;
   }
 #endif
 
@@ -316,13 +320,15 @@ static void tport_check_trunc(tport_t *tp, su_addrinfo_t *ai)
 #if TPORT_UDP_PKTINFO
 /** Receive a datagram together with the local address it was sent to.
  *
- * @param local  the local address, family 0 if the kernel did not tell it
+ * @param local    the local address, family 0 if the kernel did not tell it
+ * @param ifindex  the index of the interface it arrived on, 0 if not told
  */
 static
 ssize_t tport_udp_recv_at(tport_t const *self,
 			  msg_iovec_t iov[], size_t iovlen,
 			  su_sockaddr_t *from, socklen_t *fromlen,
-			  su_sockaddr_t local[1])
+			  su_sockaddr_t local[1],
+			  unsigned *ifindex)
 {
   struct msghdr hdr[1] = {{0}};
   struct cmsghdr *c;
@@ -344,12 +350,14 @@ ssize_t tport_udp_recv_at(tport_t const *self,
     return n;
 
   *fromlen = hdr->msg_namelen;
+  *ifindex = 0;
 
   for (c = CMSG_FIRSTHDR(hdr); c; c = CMSG_NXTHDR(hdr, c)) {
     if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
       struct in_pktinfo info;
 
       memcpy(&info, CMSG_DATA(c), sizeof info);
+      *ifindex = (unsigned)info.ipi_ifindex;
 
       local->su_len = sizeof local->su_sin;
       local->su_family = AF_INET;
@@ -366,6 +374,7 @@ ssize_t tport_udp_recv_at(tport_t const *self,
       struct in6_pktinfo info;
 
       memcpy(&info, CMSG_DATA(c), sizeof info);
+      *ifindex = (unsigned)info.ipi6_ifindex;
 
       local->su_len = sizeof local->su_sin6;
       local->su_family = AF_INET6;
@@ -510,13 +519,26 @@ int tport_recv_dgram(tport_t *self)
   from = (su_sockaddr_t *)ai->ai_addr, fromlen = (socklen_t)(ai->ai_addrlen);
 
 #if TPORT_UDP_PKTINFO
-  if (self->tp_pri->pri_wildcard) {
+  if (self->tp_pri->pri_pktinfo) {
     su_sockaddr_t local[1];
+    unsigned ifindex = 0;
 
     memset(local, 0, sizeof local);
-    n = tport_udp_recv_at(self, iovec, veclen, from, &fromlen, local);
-    if (n != SOCKET_ERROR)
-      msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local));
+    n = tport_udp_recv_at(self, iovec, veclen, from, &fromlen, local,
+			  &ifindex);
+    if (n != SOCKET_ERROR) {
+      if (!tport_on_interface(self->tp_pri, ifindex)) {
+	/* The transport listens on some interfaces only, and this datagram
+	 * arrived on another one */
+	SU_DEBUG_7(("%s(%p): datagram dropped: "
+		    "it did not arrive on an interface of this transport\n",
+		    __func__, (void *)self));
+	msg_destroy(msg), self->tp_msg = NULL;
+	return 0;
+      }
+      if (self->tp_pri->pri_wildcard)
+	msg_set_local_address(msg, local, SU_SOCKADDR_SIZE(local));
+    }
   }
   else
 #endif

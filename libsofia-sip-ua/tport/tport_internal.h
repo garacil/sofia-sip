@@ -253,6 +253,13 @@ struct tport_s {
 };
 
 /** @internal Primary structure */
+/** Maximum number of interfaces a transport can be restricted to. */
+#define TPORT_INTERFACES_MAX (16)
+
+/** The address is bound even if it is not an address of the host yet.
+ * @internal Flag in ai_flags, with the TP_AI_ flags of <sofia-sip/tport.h>. */
+#define TP_AI_FREEBIND   0x10000
+
 struct tport_primary {
   tport_t             pri_primary[1];   /**< Transport part */
 #if DOXYGEN_ONLY
@@ -280,9 +287,20 @@ struct tport_primary {
   unsigned            pri_wildcard:1;	/**< Bound to the wildcard address:
 					 * serves every local address */
   unsigned            pri_named:1;	/**< The bind URL gave it a name */
+  unsigned            pri_pktinfo:1;	/**< The socket reports the local
+					 * address and the interface of what
+					 * it receives */
   unsigned:0;
 
   void               *pri_stun_handle;
+
+  /** Interfaces to listen on, by name (TPTAG_INTERFACE()).  None: any. */
+  unsigned            pri_nifs;
+  struct tport_interface {
+    char              ti_name[32];	/**< Interface name */
+    unsigned          ti_index;		/**< Its index now, 0 if not there */
+  } pri_ifs[TPORT_INTERFACES_MAX];
+  long                pri_ifs_checked;	/**< When the indexes were read */
 
   tport_params_t      pri_params[1];      /**< Transport parameters */
 };
@@ -450,6 +468,8 @@ int tport_register_secondary(tport_t *self, su_wakeup_f wakeup, int events);
 void tport_set_local(tport_t *self);
 void tport_local_address(tport_t const *self, msg_t *msg, su_sockaddr_t su[1]);
 void tport_flow_forget(tport_t const *self, su_sockaddr_t const *peer);
+int tport_on_interface(tport_primary_t *pri, unsigned ifindex);
+int tport_accepted_on_interface(tport_primary_t *pri, su_socket_t s);
 void tport_zap_secondary(tport_t *self);
 
 int tport_set_secondary_timer(tport_t *self);
